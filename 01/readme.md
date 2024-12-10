@@ -283,3 +283,211 @@ func (c *client) newConn() (*grpc.ClientConn, io.Closer, error) {
 참고로 application에 대한 .proto 형식은 여기서 확인 가능하다.
 
 https://github.com/argoproj/argo-cd/blob/master/server/application/application.proto
+
+---
+
+# api server 라이프사이클
+
+cli로 받은 요청은 argocd api server가 처리한다. 따라서 server에 대한 코드를 분석해야 한다. 그럼 다시 cli 실행 부분부터 api server 동작까지 흘러가는 방식으로 진행해보자.
+
+```go
+	// ...		
+	case "argocd-server":
+		command = apiserver.NewCommand()
+	// ...
+```
+
+`apiserver.NewCommand()` 내부로 들어간다. 내부 구조는 심플하다. cliName에 대응하는 이벤트를 바로 설정하므로 해당 이벤트가 호출된다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/4f6e4088efc789a8cb44d3e25a444467c46d761f/cmd/argocd-server/commands/argocd_server.go#L55
+func NewCommand() *cobra.Command {
+	// 함수 내부 변수 세팅
+	// ...
+	command := &cobra.Command{
+		Use:               cliName,
+		DisableAutoGenTag: true,
+		Run: func(c *cobra.Command, args []string) {
+			// some logic
+			// ...
+		}
+		// 커맨드 변수 flagging
+		// ...
+		
+	// cache 설정
+	tlsConfigCustomizerSrc = tls.AddTLSFlagsToCmd(command)
+	cacheSrc = servercache.AddCacheFlagsToCmd(command, cacheutil.Options{
+		OnClientCreated: func(client *redis.Client) {
+			redisClient = client
+		},
+	})
+	repoServerCacheSrc = reposervercache.AddCacheFlagsToCmd(command, cacheutil.Options{FlagPrefix: "repo-server-"})
+	return command
+```
+
+중요한 건 Run 내부이므로 해당 함수를 분석해야 한다. **argocd는 서버로 동작하니 이 부분에서 blocking call이 있어야 한다**는 합리적인 의심을 해볼 수 있다.
+
+다음은 Run의 내부이다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/4f6e4088efc789a8cb44d3e25a444467c46d761f/cmd/argocd-server/commands/argocd_server.go#L105
+		Run: func(c *cobra.Command, args []string) {
+			
+			// argocd server 설정
+			// ...
+			argocd := server.NewServer(ctx, argoCDOpts, appsetOpts) // argocd 생성
+			argocd.Init(ctx) // informer 고루틴 실행
+			for {
+				var closer func()
+				serverCtx, cancel := context.WithCancel(ctx)
+				lns, err := argocd.Listen() // tcp 서버 열기
+				errors.CheckError(err)
+				// ...
+				argocd.Run(serverCtx, lns) // 서버 실행
+				if closer != nil {
+					closer()
+				}
+				cancel()
+				if argocd.TerminateRequested() {
+					break
+				}
+			}
+		},
+```
+
+보통 일반적인 서버 블로킹은 Run같은 메서드가 한다. 위에 딱 의심스러운 argocd.Run이 있다. 이 부분을 더 들어가보자. Run 메서드가 해야 할 작업은 명확하다. 여러 대의 서버 및 mux를 고루틴으로 열고 해당 고루틴의 종료를 감지 & waitgroup 대기하는 것이다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/server.go#L535
+func (a *ArgoCDServer) Run(ctx context.Context, listeners *Listeners) {
+	// ...
+	// http / https mux & grpc server setting
+	svcSet := newArgoCDServiceSet(a)
+	a.serviceSet = svcSet
+	grpcS, appResourceTreeFn := a.newGRPCServer()
+	grpcWebS := grpcweb.WrapServer(grpcS)
+	var httpS *http.Server
+	var httpsS *http.Server
+	if a.useTLS() {
+		httpS = newRedirectServer(a.ListenPort, a.RootPath)
+		httpsS = a.newHTTPServer(ctx, a.ListenPort, grpcWebS, appResourceTreeFn, listeners.GatewayConn, metricsServ)
+	} else {
+		httpS = a.newHTTPServer(ctx, a.ListenPort, grpcWebS, appResourceTreeFn, listeners.GatewayConn, metricsServ)
+	}
+	// ...
+
+	// goroutine으로 서버 호스팅 및 에러 감지
+	go func() { a.checkServeErr("grpcS", grpcS.Serve(grpcL)) }()
+	go func() { a.checkServeErr("httpS", httpS.Serve(httpL)) }()
+	if a.useTLS() {
+		go func() { a.checkServeErr("httpsS", httpsS.Serve(httpsL)) }()
+		go func() { a.checkServeErr("tlsm", tlsm.Serve()) }()
+	}
+	go a.watchSettings()
+	go a.rbacPolicyLoader(ctx)
+	go func() { a.checkServeErr("tcpm", tcpm.Serve()) }()
+	go func() { a.checkServeErr("metrics", metricsServ.Serve(listeners.Metrics)) }()
+	if !cache.WaitForCacheSync(ctx.Done(), a.projInformer.HasSynced, a.appInformer.HasSynced) {
+		log.Fatal("Timed out waiting for project cache to sync")
+	}
+
+	// 종료 시점 컬백함수 호출
+	shutdownFunc := func() {
+		// ...
+		var wg gosync.WaitGroup
+
+		// Shutdown http server
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := httpS.Shutdown(shutdownCtx)
+			// ...
+		}()
+
+		if a.useTLS() {
+			// Shutdown https server
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := httpsS.Shutdown(shutdownCtx)
+				// ...
+			}()
+		}
+
+		// Shutdown gRPC server
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			grpcS.GracefulStop()
+		}()
+
+		// Shutdown metrics server
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := metricsServ.Shutdown(shutdownCtx)
+			// ...
+		}()
+
+		if a.useTLS() {
+			// Shutdown tls server
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				tlsm.Close()
+			}()
+		}
+
+		// Shutdown tcp server
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tcpm.Close()
+		}()
+
+		c := make(chan struct{})
+		// This goroutine will wait for all servers to conclude the shutdown
+		// process
+		go func() { // 모든 서버 종료 이벤트 수신 시 채널 닫기
+			defer close(c)
+			wg.Wait()
+		}()
+
+		// 채널 닫힐 때까지 대기
+		select {
+		case <-c:
+			log.Info("All servers were gracefully shutdown. Exiting...")
+		// ...
+		}
+	}
+	
+	// 시그널 등록
+	a.shutdown = shutdownFunc
+	signal.Notify(a.stopCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	a.available.Store(true)
+
+	// 종료 대기
+	select {
+	case signal := <-a.stopCh:
+		log.Infof("API Server received signal: %s", signal.String())
+		// SIGUSR1 is used for triggering a server restart
+		if signal != syscall.SIGUSR1 {
+			a.terminateRequested.Store(true)
+		}
+		a.shutdown()
+	case <-ctx.Done():
+		log.Infof("API Server: %s", ctx.Err())
+		a.terminateRequested.Store(true)
+		a.shutdown()
+	}
+}
+
+```
+
+서버 실행을 다시 한 번 살펴보자. 서버에 대한 라이프사이클은 다음 로직을 따른다.
+
+1. cli실행
+2. 실행하면 server 생성 → tcp 서버 열기 → 서버 실행 과정으로 동작
+3. 서버 실행
+4. 종료 call이 떨어지면 waitgroup을 통해 올바르게 종료하는지 확인
+5. 모든 서버가 종료되기를 대기하고 채널 수신 후 프로세스 종료
