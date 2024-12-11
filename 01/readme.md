@@ -491,3 +491,237 @@ func (a *ArgoCDServer) Run(ctx context.Context, listeners *Listeners) {
 3. 서버 실행
 4. 종료 call이 떨어지면 waitgroup을 통해 올바르게 종료하는지 확인
 5. 모든 서버가 종료되기를 대기하고 채널 수신 후 프로세스 종료
+
+---
+
+# grpc 요청 동작
+
+그렇지만 서버 라이프사이클은 크게 중요하지 않다. 중요한 건 어떻게 요청이 처리되는가이다. 이를 확인하려면 grpcServer에 어떻게 구현한 rpc가 등록되는지 찾아야 한다.
+
+다시 Run 메서드를 확인해보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/server.go#L535
+func (a *ArgoCDServer) Run(ctx context.Context, listeners *Listeners) {
+	// ...
+	// http / https mux & grpc server setting
+	grpcS, appResourceTreeFn := a.newGRPCServer()
+	// ...
+```
+
+여기서 `a.newGRPCServer()` 가 호출된다. 이 내부를 들어가자. 내부에는 grpc 서버가 생성되고 다양한 서비스가 서버에 등록되는 것을 확인할 수 있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/server.go#L876C1-L876C87
+func (a *ArgoCDServer) newGRPCServer() (*grpc.Server, application.AppResourceTreeFn) {
+	// ...
+	// grpc 서버 생성
+	grpcS := grpc.NewServer(sOpts...)
+	
+	// grpc 서버에 service 레지스터
+	versionpkg.RegisterVersionServiceServer(grpcS, a.serviceSet.VersionService)
+	clusterpkg.RegisterClusterServiceServer(grpcS, a.serviceSet.ClusterService)
+	applicationpkg.RegisterApplicationServiceServer(grpcS, a.serviceSet.ApplicationService) // application service 등록은 여기에 존재
+	applicationsetpkg.RegisterApplicationSetServiceServer(grpcS, a.serviceSet.ApplicationSetService)
+	notificationpkg.RegisterNotificationServiceServer(grpcS, a.serviceSet.NotificationService)
+	repositorypkg.RegisterRepositoryServiceServer(grpcS, a.serviceSet.RepoService)
+	repocredspkg.RegisterRepoCredsServiceServer(grpcS, a.serviceSet.RepoCredsService)
+	sessionpkg.RegisterSessionServiceServer(grpcS, a.serviceSet.SessionService)
+	settingspkg.RegisterSettingsServiceServer(grpcS, a.serviceSet.SettingsService)
+	projectpkg.RegisterProjectServiceServer(grpcS, a.serviceSet.ProjectService)
+	accountpkg.RegisterAccountServiceServer(grpcS, a.serviceSet.AccountService)
+	certificatepkg.RegisterCertificateServiceServer(grpcS, a.serviceSet.CertificateService)
+	gpgkeypkg.RegisterGPGKeyServiceServer(grpcS, a.serviceSet.GpgkeyService)
+	// Register reflection service on gRPC server.
+	reflection.Register(grpcS)
+	grpc_prometheus.Register(grpcS)
+	errorsutil.CheckError(a.serviceSet.ProjectService.NormalizeProjs())
+	return grpcS, a.serviceSet.AppResourceTreeFn
+}
+
+```
+
+관심있는 app에 대한 서비스는 `applicationpkg.RegisterApplicationServiceServer(grpcS, a.serviceSet.ApplicationService)` 이 부분에서 등록되는 것으로 보인다. 그럼 s.serviceSet.ApplicationService가 어디서 초기화되는지 찾아보자. 이 부분은 다시 Run 서버의 다음 부분이다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/server.go#L535
+func (a *ArgoCDServer) Run(ctx context.Context, listeners *Listeners) {
+	// ...
+	// http / https mux & grpc server setting
+	svcSet := newArgoCDServiceSet(a)
+	a.serviceSet = svcSet
+```
+
+이 함수를 확인하자. 일단 application 관련 정보만 찾아보자. 온 종류의 서비스를 다 만드는데 지금은 확인할 필요가 없다. 결국 app용으로 호출되는 건 `application.NewServer(...)` 이다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/server.go#L979C1-L1067C2
+func newArgoCDServiceSet(a *ArgoCDServer) *ArgoCDServiceSet {
+	kubectl := kubeutil.NewKubectl()
+	// ...
+	applicationService, appResourceTreeFn := application.NewServer(
+		a.Namespace,
+		a.KubeClientset,
+		a.AppClientset,
+		a.appLister,
+		a.appInformer,
+		nil,
+		a.RepoClientset,
+		a.Cache,
+		kubectl,
+		a.db,
+		a.enf,
+		projectLock,
+		a.settingsMgr,
+		a.projInformer,
+		a.ApplicationNamespaces,
+		a.EnableK8sEvent,
+	)
+	// ...
+	return &ArgoCDServiceSet{
+		ClusterService:        clusterService,
+		RepoService:           repoService,
+		RepoCredsService:      repoCredsService,
+		SessionService:        sessionService,
+		ApplicationService:    applicationService,
+		AppResourceTreeFn:     appResourceTreeFn,
+		ApplicationSetService: applicationSetService,
+		ProjectService:        projectService,
+		SettingsService:       settingsService,
+		AccountService:        accountService,
+		NotificationService:   notificationService,
+		CertificateService:    certificateService,
+		GpgkeyService:         gpgkeyService,
+		VersionService:        versionService,
+	}
+}
+```
+
+여기서 application.NewServer의 시그니처는 이렇다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/application/application.go#L99C1-L116C60
+func NewServer(
+	// ...
+) (application.ApplicationServiceServer, AppResourceTreeFn) {
+	s := &Server{
+		// ...
+	}
+	return s, s.getAppResources
+}
+```
+
+이 함수를 살펴보면 리턴으로 &Server를 리턴한다. 이 함수는 다음의 메서드를 갖는다. 이 메서드가 grpc 서비스를 구현하는 메서드인 것을 확인할 수 있다. 5개만 보자.
+
+```go
+func (s *Server) Create(ctx context.Context, q *application.ApplicationCreateRequest) (*appv1.Application, error)
+func (s *Server) Delete(ctx context.Context, q *application.ApplicationDeleteRequest) (*application.ApplicationResponse, error)
+func (s *Server) DeleteResource(ctx context.Context, q *application.ApplicationResourceDeleteRequest) (*application.ApplicationResponse, error)
+func (s *Server) Get(ctx context.Context, q *application.ApplicationQuery) (*appv1.Application, error)
+func (s *Server) GetApplicationSyncWindows(ctx context.Context, q *application.ApplicationSyncWindowsQuery) (*application.ApplicationSyncWindowsResponse, error)
+// ...
+```
+
+여기서 Create 요청이 처리된다. 이 함수는 한 번 따라서 읽어보자. 상당히 직관적으로 작성되어 있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/dfbfdbab1188dfb26b454e47ac06c70ed484c066/server/application/application.go#L314C1-L314C116
+func (s *Server) Create(ctx context.Context, q *application.ApplicationCreateRequest) (*appv1.Application, error) {
+	// Application nil 체크
+	if q.GetApplication() == nil {
+		return nil, fmt.Errorf("error creating application: application is nil in request")
+	}
+	a := q.GetApplication()
+
+	// rbac check
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionCreate, a.RBACName(s.ns)); err != nil {
+		return nil, err
+	}
+
+	// get project lock
+	s.projectLock.RLock(a.Spec.GetProject())
+	defer s.projectLock.RUnlock(a.Spec.GetProject())
+
+	validate := true
+	if q.Validate != nil {
+		validate = *q.Validate
+	}
+
+	// get app project
+	proj, err := s.getAppProject(ctx, a, log.WithField("application", a.Name))
+	if err != nil {
+		return nil, err
+	}
+
+	// validate normalize app
+	err = s.validateAndNormalizeApp(ctx, a, proj, validate)
+	if err != nil {
+		return nil, fmt.Errorf("error while validating and normalizing app: %w", err)
+	}
+
+	appNs := s.appNamespaceOrDefault(a.Namespace)
+
+	// 가능한 ns 확인
+	if !s.isNamespaceEnabled(appNs) {
+		return nil, security.NamespaceNotPermittedError(appNs)
+	}
+
+	// Don't let the app creator set the operation explicitly. Those requests should always go through the Sync API.
+	if a.Operation != nil {
+		log.WithFields(log.Fields{
+			"application":            a.Name,
+			argocommon.SecurityField: argocommon.SecurityLow,
+		}).Warn("User attempted to set operation on application creation. This could have allowed them to bypass branch protection rules by setting manifests directly. Ignoring the set operation.")
+		a.Operation = nil
+	}
+
+	// k8s object app 생성
+	created, err := s.appclientset.ArgoprojV1alpha1().Applications(appNs).Create(ctx, a, metav1.CreateOptions{})
+	// 생성 성공인 경우
+	if err == nil {
+		s.logAppEvent(created, ctx, argo.EventReasonResourceCreated, "created application")
+		s.waitSync(created)
+		return created, nil
+	}
+	
+	// err가 존재하는 경우 아래 로직: 에러 이유가 이미 존재하는 앱이 아닌 경우
+	if !apierr.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("error creating application: %w", err)
+	}
+
+	// 기존 app 가져와서 비교 로직 진행 및 upsert
+	// act idempotent if existing spec matches new spec
+	existing, err := s.appLister.Applications(appNs).Get(a.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "unable to check existing application details (%s): %v", appNs, err)
+	}
+	equalSpecs := reflect.DeepEqual(existing.Spec, a.Spec) &&
+		reflect.DeepEqual(existing.Labels, a.Labels) &&
+		reflect.DeepEqual(existing.Annotations, a.Annotations) &&
+		reflect.DeepEqual(existing.Finalizers, a.Finalizers)
+
+	if equalSpecs {
+		return existing, nil
+	}
+	if q.Upsert == nil || !*q.Upsert {
+		return nil, status.Errorf(codes.InvalidArgument, "existing application spec is different, use upsert flag to force update")
+	}
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionUpdate, a.RBACName(s.ns)); err != nil {
+		return nil, err
+	}
+	updated, err := s.updateApp(existing, a, ctx, true)
+	if err != nil {
+		return nil, fmt.Errorf("error updating application: %w", err)
+	}
+	return updated, nil
+}
+```
+
+동작을 요약하면 다음과 같다.
+
+1. 프로젝트 정보 조회
+2. 네임스페이스 체크
+3. application 생성
+4. upsert 처리
+
+그럼 이제 궁금해진다. app 생성 후 sync와 같은 작업이 되는 경우 어떻게 argocd는 이를 처리하는 것인가? 다음은 application controller를 살펴보자.
