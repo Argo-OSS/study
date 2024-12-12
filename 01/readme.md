@@ -725,3 +725,189 @@ func (s *Server) Create(ctx context.Context, q *application.ApplicationCreateReq
 4. upsert 처리
 
 그럼 이제 궁금해진다. app 생성 후 sync와 같은 작업이 되는 경우 어떻게 argocd는 이를 처리하는 것인가? 다음은 application controller를 살펴보자.
+
+---
+
+# application controller
+
+여기도 맥락은 server 로직이랑 유사하다. 그래서 초반은 건너가자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/cmd/argocd-application-controller/commands/argocd_application_controller.go#L51
+func NewCommand() *cobra.Command {
+	// ...
+	command := cobra.Command{
+		Use:               cliName,
+		Short:             "Run ArgoCD Application Controller",
+		Long:              "ArgoCD application controller is a Kubernetes controller that continuously monitors running applications and compares the current, live state against the desired target state (as specified in the repo). This command runs Application Controller in the foreground.  It can be configured by following options.",
+		DisableAutoGenTag: true,
+		RunE: func(c *cobra.Command, args []string) error { // ✅ 일로 진입
+			// ...
+		}
+		// ...
+		return command
+```
+
+위 코드 내부의 로직은 RunE 내부에서 일어난다. 당연하다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/cmd/argocd-application-controller/commands/argocd_application_controller.go#L96C1-L98C18
+		RunE: func(c *cobra.Command, args []string) error {
+			// ...
+			kubeClient := kubernetes.NewForConfigOrDie(config)
+			appClient := appclientset.NewForConfigOrDie(config)
+			// ...
+			repoClientset := apiclient.NewRepoServerClientset(repoServerAddress, repoServerTimeoutSeconds, tlsConfig)
+			// ...
+			var appController *controller.ApplicationController
+			appController, err = controller.NewApplicationController( // ✅ informer 초기화
+				// ...
+			}
+			// ...
+			go appController.Run(ctx, statusProcessors, operationProcessors) // ✅ controller 실행
+			// ...
+```
+
+---
+
+# controller 생성 부분
+
+먼저 controller를 생성하는 부분을 살펴보자. 여기서는 app위주로 본다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L151
+func NewApplicationController(
+	// ...
+) ( // ... ) {
+	// ...
+	appInformer, appLister := ctrl.newApplicationInformerAndLister() // ✅ 이 부분에서 argocd app에 대한 informer 정보가 갱신된다.
+	// ...
+}
+```
+
+`newApplicationInformerAndLister` 내부를 살펴보면 다음과 같다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L2198
+func (ctrl *ApplicationController) newApplicationInformerAndLister() (cache.SharedIndexInformer, applisters.ApplicationLister) {
+	// 생성자 스킵
+	// ...
+	_, err := informer.AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				if !ctrl.canProcessApp(obj) {
+					return
+				}
+				key, err := cache.MetaNamespaceKeyFunc(obj) // ✅ k8s obj로부터 key를 추출
+				if err == nil {
+					ctrl.appRefreshQueue.AddRateLimited(key) // ✅ refreshqueue에 key 삽입
+				}
+				newApp, newOK := obj.(*appv1.Application)
+				if err == nil && newOK {
+					ctrl.clusterSharding.AddApp(newApp) // ✅ AddApp으로 새로운 App 넣음
+				}
+			},
+			UpdateFunc: func(old, new interface{}) {
+				if !ctrl.canProcessApp(new) {
+					return
+				}
+
+				key, err := cache.MetaNamespaceKeyFunc(new)
+				if err != nil {
+					return
+				}
+
+				var compareWith *CompareWith
+				var delay *time.Duration
+
+				oldApp, oldOK := old.(*appv1.Application)
+				newApp, newOK := new.(*appv1.Application)
+				if oldOK && newOK {
+					if automatedSyncEnabled(oldApp, newApp) {
+						getAppLog(newApp).Info("Enabled automated sync")
+						compareWith = CompareWithLatest.Pointer()
+					}
+					if ctrl.statusRefreshJitter != 0 && oldApp.ResourceVersion == newApp.ResourceVersion {
+						// Handler is refreshing the apps, add a random jitter to spread the load and avoid spikes
+						jitter := time.Duration(float64(ctrl.statusRefreshJitter) * rand.Float64())
+						delay = &jitter
+					}
+				}
+
+				ctrl.requestAppRefresh(newApp.QualifiedName(), compareWith, delay) 
+				if !newOK || (delay != nil && *delay != time.Duration(0)) {
+					ctrl.appOperationQueue.AddRateLimited(key) // ✅ refreshqueue에 key 삽입
+				}
+				ctrl.clusterSharding.UpdateApp(newApp) // ✅ UpdatedApp으로 App 업데이트
+			},
+			DeleteFunc: func(obj interface{}) {
+				if !ctrl.canProcessApp(obj) {
+					return
+				}
+				// IndexerInformer uses a delta queue, therefore for deletes we have to use this
+				// key function.
+				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+				if err == nil {
+					// for deletes, we immediately add to the refresh queue
+					ctrl.appRefreshQueue.Add(key) // ✅ refreshqueue에 key 삽입
+				}
+				delApp, delOK := obj.(*appv1.Application)
+				if err == nil && delOK {
+					ctrl.clusterSharding.DeleteApp(delApp) // ✅ DeleteApp 호출
+				}
+			},
+		},
+	)
+}
+```
+
+위의 모든 연산은 queue에 key를 넣는다. key는 string인데 큐에다가 key를 집어넣는다. 이 key는 object를 표현하는 값으로 보인다. 뭔진 잘 모르겠지만 비동기적으로 string이 넘어가고 어디선가 처리한다 정도로 이해하자.
+
+위 코드를 살펴보면 컬백 함수에 obj가 들어오고 obj가 연산에 맞는 로직을 실행한다. 예를 들면 다음과 같다.
+
+- AddFunc: clusterSharding.AddApp(newApp)으로 생성 어쩌고를 한다.
+- UpdateFunc: refresh하는 로직을 실행한다.
+- DeleteFunc: clusterSharding.DeleteApp(delApp)으로 삭제 어쩌고를 한다.
+
+그냥 k8s 이벤트에 맞는 로직을 실행한다고 보면 된다. 당연히 argocd에서 clusterSharding.AddApp정의로 가면 인터페이스로 가서 세부 구현 없음이 튀어나온다. 좀만 더 찾아보면 이 정의는 다음과 같다는 것을 확인할 수 있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/sharding/cache.go#L213C1-L213C67
+func (sharding *ClusterSharding) AddApp(a *v1alpha1.Application) {
+	sharding.lock.Lock()
+	defer sharding.lock.Unlock()
+
+	_, ok := sharding.Apps[a.Name]
+	sharding.Apps[a.Name] = a
+	if !ok {
+		sharding.updateDistribution()
+	} else {
+		log.Debugf("Skipping sharding distribution update. App already added")
+	}
+}
+
+func (sharding *ClusterSharding) DeleteApp(a *v1alpha1.Application) {
+	sharding.lock.Lock()
+	defer sharding.lock.Unlock()
+	if _, ok := sharding.Apps[a.Name]; ok {
+		delete(sharding.Apps, a.Name)
+		sharding.updateDistribution()
+	}
+}
+
+func (sharding *ClusterSharding) UpdateApp(a *v1alpha1.Application) {
+	sharding.lock.Lock()
+	defer sharding.lock.Unlock()
+
+	_, ok := sharding.Apps[a.Name]
+	sharding.Apps[a.Name] = a
+	if !ok {
+		sharding.updateDistribution()
+	} else {
+		log.Debugf("Skipping sharding distribution update. No relevant changes")
+	}
+}
+
+```
+
+로직은 단순하다. lock잡고 map에 W를 하는 연산이다. 공통적으로 호출하는 부분이 있다. `sharding.updateDistribution()` 모두 이놈을 호출하는데 대충 코드를 보면 배포하는 클러스터별로 샤딩이 이루어지는 것 같다. 적당히만 보면 될 부분으로 보인다. 컨트롤러는 클러스터별로 실제로 샤딩을 한다.
