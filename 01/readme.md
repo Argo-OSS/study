@@ -911,3 +911,193 @@ func (sharding *ClusterSharding) UpdateApp(a *v1alpha1.Application) {
 ```
 
 로직은 단순하다. lock잡고 map에 W를 하는 연산이다. 공통적으로 호출하는 부분이 있다. `sharding.updateDistribution()` 모두 이놈을 호출하는데 대충 코드를 보면 배포하는 클러스터별로 샤딩이 이루어지는 것 같다. 적당히만 보면 될 부분으로 보인다. 컨트롤러는 클러스터별로 실제로 샤딩을 한다.
+
+---
+
+# controller 실행 부분
+
+여기서 뒷부분 ✅이다. 가보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/cmd/argocd-application-controller/commands/argocd_application_controller.go#L96C1-L98C18
+		RunE: func(c *cobra.Command, args []string) error {
+			// ...
+			kubeClient := kubernetes.NewForConfigOrDie(config)
+			appClient := appclientset.NewForConfigOrDie(config)
+			// ...
+			repoClientset := apiclient.NewRepoServerClientset(repoServerAddress, repoServerTimeoutSeconds, tlsConfig)
+			// ...
+			var appController *controller.ApplicationController
+			appController, err = controller.NewApplicationController( // ✅ informer 초기화
+				// ...
+			}
+			// ...
+			go appController.Run(ctx, statusProcessors, operationProcessors) // ✅ controller 실행
+			// ...
+```
+
+Run 내부에 informer.Run이 존재한다. informer.Run이 비동기로 실행되면서 k8s app obj에 대한 이벤트를 수집하게 된다. 비동기로 던진 대상에 대한 실행은 `~~~~~QueueItem` 이 처리한다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L835
+func (ctrl *ApplicationController) Run(ctx context.Context, statusProcessors int, operationProcessors int) {
+	// ...
+	go ctrl.appInformer.Run(ctx.Done())
+	go ctrl.projInformer.Run(ctx.Done())
+	
+	// ...
+	
+	for i := 0; i < statusProcessors; i++ {
+		go wait.Until(func() {
+			for ctrl.processAppRefreshQueueItem() { // refresh queue 컨트롤 반복
+			}
+		}, time.Second, ctx.Done())
+	}
+
+	for i := 0; i < operationProcessors; i++ {
+		go wait.Until(func() {
+			for ctrl.processAppOperationQueueItem() { // operation queue 컨트롤 반복
+			}
+		}, time.Second, ctx.Done())
+	}
+	
+	go wait.Until(func() {
+		for ctrl.processAppComparisonTypeQueueItem() { // app comparison type queue 컨트롤 반복
+		}
+	}, time.Second, ctx.Done())
+
+	go wait.Until(func() {
+		for ctrl.processProjectQueueItem() { // project 컨트롤 반복
+		}
+	}, time.Second, ctx.Done())
+	<-ctx.Done()
+}
+```
+
+여기 코드를 살펴보면 controller 초기화 코드에서 `appRefreshQueue.Add`로 던지던 부분을 처리하는 것처럼 보이는 부분이 있다. 같은 refresh가 붙은 걸 보면 이 부분이 subscriber인 것이 충분히 가능성이 있다. 해당 코드가 생성 요청을 수집한 대상이라고 보면 된다. 이 함수 동작을 분석하기에는 너무 길어지니 여기서 끊고 가자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1550C1-L1550C85
+func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext bool) {
+	appKey, shutdown := ctrl.appOperationQueue.Get()
+	// ...
+	
+	// key 이용해서 obj 조회
+	obj, exists, err := ctrl.appInformer.GetIndexer().GetByKey(appKey)
+	// ...
+	
+	// app이 refresh를 해야하는지 점검
+	needRefresh, refreshType, comparisonLevel := ctrl.needRefreshAppStatus(origApp, ctrl.statusRefreshTimeout, ctrl.statusHardRefreshTimeout)
+	// ...
+	
+	// copy 뜨고
+	app := origApp.DeepCopy()
+	
+	if comparisonLevel == ComparisonWithNothing {
+		// ComparisonWithNothing level 분기
+	}
+	
+	// app condition refresh
+	project, hasErrors := ctrl.refreshAppConditions(app)
+	if hasErrors {
+		// ...
+	}
+	
+	hasMultipleSources := app.Spec.HasMultipleSources()
+	if hasMultipleSources { // multiple resoures에 대한 처리
+		// ...
+	} else { // multiple resoures가 아닌 경우 처리
+		// ...
+	}
+	
+	// ...
+	// app state 비교
+	compareResult, err := ctrl.appStateManager.CompareAppState( ... )
+	
+	// ...
+	// application 레거시 필드를 새 필드로 마이그레이션하는 정규화 작업을 진행
+	ctrl.normalizeApplication(origApp, app)
+	
+	// ... 
+	// app과 compareResult를 비교하여 tree 리턴. 사실 잘 모르겠음
+	tree, err := ctrl.setAppManagedResources(app, compareResult)
+	
+	// ...
+	// sync 가능 상태 확인
+	canSync, _ := project.Spec.SyncWindows.Matches(app).CanSync(false)
+	
+	// ...
+	// 싱크 가능인 경우
+	if canSync {
+		syncErrCond, opMS := ctrl.autoSync( ... )
+	} else {
+		// 불가능이면 application condition을 sync error로 설정
+	}
+	// ...
+}
+```
+
+위 함수 동작에 대한 mermaid이다.
+
+```mermaid
+sequenceDiagram
+    participant Controller as ApplicationController
+    participant RefreshQueue as appRefreshQueue
+    participant Informer as Kubernetes Informer
+    participant Cache as Cache
+    participant StateManager as AppStateManager
+
+    Controller->>RefreshQueue: Get appKey
+    RefreshQueue-->>Controller: appKey or shutdown
+    alt Queue Shutdown
+        Controller-->RefreshQueue: Exit process
+    end
+
+    Controller->>Informer: Get app by key
+    Informer-->>Controller: app object or error
+    alt app not found or invalid
+        Controller-->RefreshQueue: Mark Done
+        Controller-->RefreshQueue: Exit process
+    end
+
+    Controller->>Controller: Check if refresh is needed
+    alt No refresh needed
+        Controller-->RefreshQueue: Mark Done
+        Controller-->RefreshQueue: Exit process
+    end
+
+    Controller->>Controller: Start reconciliation process
+    Controller->>Cache: Get cached managed resources
+    alt Cache miss
+        Controller->>Controller: Perform full reconciliation
+    end
+
+    Controller->>StateManager: CompareAppState with revisions and sources
+    StateManager-->>Controller: Comparison result
+    alt CompareAppState error
+        Controller-->Controller: Set app status to Unknown
+        Controller->>Cache: Clear managed resources
+        Controller-->RefreshQueue: Mark Done
+        Controller-->RefreshQueue: Exit process
+    end
+
+    Controller->>Controller: Normalize application object
+    Controller->>Cache: Update managed resources and resource tree
+    Cache-->>Controller: Success or failure
+
+    Controller->>Controller: Check sync windows
+    alt Sync allowed
+        Controller->>Controller: Perform auto-sync
+        Controller-->>Controller: Sync status and errors
+    else Sync blocked
+        Controller-->Controller: Log sync prevented
+    end
+
+    Controller->>Controller: Update app status
+    Controller->>Cache: Persist updated app status
+
+    Controller->>RefreshQueue: Mark Done
+    Controller->>RefreshQueue: Add to OperationQueue
+    Controller-->RefreshQueue: End process
+
+```
