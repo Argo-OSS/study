@@ -1577,3 +1577,280 @@ func (ctrl *ApplicationController) autoSync(app *appv1.Application, syncStatus *
 ```
 
 이후 app status를 compareResult 필드로 변경하고 마무리. 이렇게 하면 `processAppRefreshQueueItem`의 동작을 모두 살펴봤다. 그러나 아직 살펴보지 않은 부분이 하나 있는데 CompareAppState이 함수 동작을 이제부터 살펴보자.
+
+---
+
+# CompareAppState
+
+함수가 너무 길어서 먼저 테스트 코드를 살펴보는 게 좋아보인다.
+
+가장 기본적인 테스트 코드를 살펴보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/6a3cdb6ea529b63726f8a1a620819b8f5ccca184/controller/state_test.go#L36
+// TestCompareAppStateEmpty tests comparison when both git and live have no objects
+func TestCompareAppStateEmpty(t *testing.T) {
+	// app 생성
+	app := newFakeApp()
+	//application controller에 미리 적용할 fakeData setting
+	data := fakeData{
+		manifestResponse: &apiclient.ManifestResponse{
+			Manifests: []string{},
+			Namespace: test.FakeDestNamespace,
+			Server:    test.FakeClusterURL,
+			Revision:  "abc123",
+		},
+		managedLiveObjs: make(map[kube.ResourceKey]*unstructured.Unstructured),
+	}
+	ctrl := newFakeController(&data, nil) // controller 생성
+	sources := make([]argoappv1.ApplicationSource, 0)
+	sources = append(sources, app.Spec.GetSource())
+	revisions := make([]string, 0)
+	revisions = append(revisions, "")
+	
+	// app, proj, revisions, sources를 집어넣고 app state 비교 진행
+	compRes, err := ctrl.appStateManager.CompareAppState(app, &defaultProj, revisions, sources, false, false, nil, false, false)
+	// ...
+}
+```
+
+테스트 통과 조건은 지금 중요하지 않다. 위의 테스트 코드가 CompareAppState에서 어떤 코드를 지나가는지 일단 확인해보자. 그럼 주요 동작을 유추할 수 있다. 주요 요약 부분은 아래와 같다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/state.go#L432
+func (m *appStateManager) CompareAppState( ... ) (*comparisonResult, error) {
+	
+	// ...
+	// 로컬에 있는 manifest가 없으면 sources의 targetRevisions추가(사실 왜 확인하는지 모르겠음)
+	if len(localManifests) == 0 {
+		
+		// ...
+		
+		// 원격 저장소에 있는 obj 목록 가져오기
+		targetObjs, manifestInfos, revisionUpdated, err = m.GetRepoObjs( ... )
+		
+		// ...
+		
+	} else { // manifest가 있는 경우
+		
+		// ...
+		
+	}
+	
+	var infoProvider kubeutil.ResourceInfoProvider
+	infoProvider, err = m.liveStateCache.GetClusterCache(app.Spec.Destination.Server)
+	// ... 
+	// targetObjs가 여러 앱에서 관리되는 대상인지 확인하는 과정으로 추측 (정확히는 모르겠음)
+	targetObjs, dedupConditions, err := DeduplicateTargetObjects(app.Spec.Destination.Namespace, targetObjs, infoProvider)
+	
+	// ...
+	
+	// liveObj 가져오기: 대상 클러스터에 배포된 object 조회
+	liveObjByKey, err := m.liveStateCache.GetManagedLiveObjs(app, targetObjs)
+	
+	// argocd app에 딸린 리소스에 대한 추적 방법 조회
+	trackingMethod := argo.GetTrackingMethod(m.settingsMgr)
+	
+	// 재조정 대상 object 조회
+	reconciliation := sync.Reconcile(targetObjs, liveObjByKey, app.Spec.Destination.Namespace, infoProvider)
+	
+	// ...
+	// diff를 어떻게 설정할 지 세팅하는 과정 진행
+	// diff config 세팅 진행: 당장은 스킵
+	// ...
+	
+	// diff config를 설정하고 diff 결과를 가져옴
+	diffResults, err := argodiff.StateDiffs(reconciliation.Live, reconciliation.Target, diffConfig)
+	
+	// ...
+	
+	// 각 리소스를 순회하면서 대상 리소스와 라이브 리소스 상태 비교 & 정보 구성
+	for i, targetObj := range reconciliation.Target {
+		// ...
+		// 자기 참조 여부 검증
+		isSelfReferencedObj := m.isSelfReferencedObj(liveObj, targetObj, app.GetName(), appLabelKey, trackingMethod, installationID)
+		
+		// 리소스 상태 초기화
+		resState := v1alpha1.ResourceStatus{ ... }
+		
+		// managedResources에 등록
+		managedResources[i] = managedResources{ ... }
+	}
+}
+
+```
+
+테스트 코드를 동작했을 때 무시되는 부분을 다 지나가고 통과되는 부분과 나름 중요해보이는 부분을 선별해보면 위 함수의 요약은 다음과 같다.
+
+- 원격 저장소에 있는 obj 목록 가져오기
+- 현재 배포 상태 조회
+- 재조정할 대상 object 조회
+- diff 범위 설정
+- 리소스 순회하면서 상태 비교
+
+그럼 다음과 같은 동작을 유추할 수 있다.
+
+- `targetObjs, manifestInfos, revisionUpdated, err = m.GetRepoObjs( ... )`이 부분에서 targetObjs가 리턴될 것이다. 테스트에서는 [], [], true, nil이 리턴된다. argocd에서 manifest가 아무것도 없어도 등록이 됐었는지 모르겠다.
+- `liveObjByKey, err := m.liveStateCache.GetManagedLiveObjs(app, targetObjs)` 현존하는 live object를 가져오는데, 비어있으니 [], nil이 리턴될 것이다.
+- `reconciliation := sync.Reconcile(targetObjs, liveObjByKey, app.Spec.Destination.Namespace, infoProvider)` reconcil할 대상이 없을 것. 따라서 모든 필드가 []로 리턴된다.
+- 모든 리소스가 일치하니 Diff도 비었을 것이다. `diffResults, err := argodiff.StateDiffs(reconciliation.Live, reconciliation.Target, diffConfig)` 결과 또한 []이다.
+- 따라서 targetObj가 없으니 순회가 일어나지 않고 종료된다.
+
+다음 테스트 케이스는 이렇다.
+
+```go
+	func TestCompareAppStateNamespaceMetadataDiffers(t *testing.T) {
+		app := newFakeApp()
+		app.Spec.SyncPolicy.ManagedNamespaceMetadata = &argoappv1.ManagedNamespaceMetadata{
+			Labels: map[string]string{
+				"foo": "bar",
+			},
+			Annotations: map[string]string{
+				"foo": "bar",
+			},
+		}
+		// ...
+```
+
+이 케이스는 다음과 같이 동작한다.
+
+- repoObjs는 똑같이 리턴이 없다.
+- GetManagedLiveObjs도 없다.
+- reconciliation도 없다.
+- resourceDiff도 없다.
+- 그러나 namespace의 metadata에 대한 변경 요청이 있다. 이 요청이 있어 syncCode가 OutOfSync가 된다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/state.go#L830
+	} else if app.HasChangedManagedNamespaceMetadata() {
+		syncCode = v1alpha1.SyncStatusCodeOutOfSync
+	}
+```
+
+- 마지막으로 syncStatus가 업데이트 된다.
+
+다음 테스트 함수를 보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/state_test.go#L88
+func TestCompareAppStateNamespaceMetadataDiffersToManifest(t *testing.T) {
+	ns := NewNamespace()
+	ns.SetName(test.FakeDestNamespace)
+	ns.SetNamespace(test.FakeDestNamespace)
+	ns.SetAnnotations(map[string]string{"bar": "bat"})
+
+	app := newFakeApp()
+	app.Spec.SyncPolicy.ManagedNamespaceMetadata = &argoappv1.ManagedNamespaceMetadata{
+		Labels: map[string]string{
+			"foo": "bar",
+		},
+		Annotations: map[string]string{
+			"foo": "bar",
+		},
+	}
+	app.Status.OperationState = &argoappv1.OperationState{
+		SyncResult: &argoappv1.SyncOperationResult{},
+	}
+
+	liveNs := ns.DeepCopy()
+	liveNs.SetAnnotations(nil)
+
+	data := fakeData{
+		manifestResponse: &apiclient.ManifestResponse{
+			Manifests: []string{toJSON(t, liveNs)}, // 리포지터리에 들어갈 리소스
+			Namespace: test.FakeDestNamespace,
+			Server:    test.FakeClusterURL,
+			Revision:  "abc123",
+		},
+		managedLiveObjs: map[kube.ResourceKey]*unstructured.Unstructured{
+			kube.GetResourceKey(ns): ns, // 실제 네임스페이스: 실제 네임스페이스에는 annotations이 적용되어 있음
+		},
+	}
+```
+
+여기서 관찰할 대상은 3개이다. 바로
+
+1. 실제 쿠버네티스에 배포된 네임스페이스: data.managedLiveObjs에 있는 ns가 쿠버네티스에 이미 존재하는 ns가 된다.
+2. 원격 저장소에 있는 manifest로 기록된 네임스페이스: fakeData.manifestResponse.Manifests의 원소로 들어가는 Manifest가 된다. 바로 liveNs이다.
+3. app에 적용되는 ns: 여기는 app에 syncPolicy로 metadata label과 annotations을 전달한다.
+
+그래서 위 로직은 다음과 같이 처리된다.
+
+- 여기서는 targetObjs로 ns가 리턴된다. manifestInfo도 마찬가지.
+- live에 적용된 오브젝트에 대한 기록이 liveObjByKey로 metadata가 없는 object가 리턴된다.
+- reconciliation에 Live와 Target이 리턴된다. target은 실제 쿠버네티스에 배포된 것, live는 원격 저장소에 있던 것
+- diffResults에 배포 예상되는 곳에 manifest를 string으로 저장한다.
+- reconciliation
+
+이번에는 ns가 아닌 pod resouce에 대한 yaml을 살펴보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/87c853e8729160a5b9add0eaea726b78cdc986e2/controller/state_test.go#L480C1-L504C2
+// TestAppRevisions tests that revisions are properly propagated for a single source app
+func TestAppRevisionsSingleSource(t *testing.T) {
+	obj1 := NewPod()
+	obj1.SetNamespace(test.FakeDestNamespace)
+	data := fakeData{
+		manifestResponse: &apiclient.ManifestResponse{
+			Manifests: []string{toJSON(t, obj1)},
+			Namespace: test.FakeDestNamespace,
+			Server:    test.FakeClusterURL,
+			Revision:  "abc123",
+		},
+		managedLiveObjs: make(map[kube.ResourceKey]*unstructured.Unstructured),
+	}
+	ctrl := newFakeController(&data, nil)
+
+	app := newFakeApp()
+	revisions := make([]string, 0)
+	revisions = append(revisions, "")
+	compRes, err := ctrl.appStateManager.CompareAppState(app, &defaultProj, revisions, app.Spec.GetSources(), false, false, nil, app.Spec.HasMultipleSources(), false)
+	require.NoError(t, err)
+	assert.NotNil(t, compRes)
+	assert.NotNil(t, compRes.syncStatus)
+	assert.NotEmpty(t, compRes.syncStatus.Revision)
+	assert.Empty(t, compRes.syncStatus.Revisions)
+}
+```
+
+위 테스트 코드를 살펴보면 빈 클러스터에 pod manifest가 존재하는 저장소가 배포된다. 로직 추적을 진행해보자.
+
+1. targetObjs에 pod 추가, manifestInfos에 pod mainfests정보가 추가된다.
+2. live Object는 없다. 당연하다. 배포된 대상이 없으니까.
+3. reconcil 대상으로 pod가 Target이 된다. 아직 배포상태는 아니므로 Live에는 존재하지 않는다. Live는 [nil]이 된다.
+4. diff 결과에서 NormalizedLive에는 null이, predictedLive에는 pod manifest가 저장된다.
+5. sync 대상을 순회한다. pod에 대한 response status를 구성하고 managed resources에 추가한다.
+6. 비교 결과 리턴. outOfSync상태일 것이 분명하다.
+
+이번에는 이 리소스 동작을 유추해보자.
+
+```go
+// ... 
+func TestCompareAppStateDuplicatedNamespacedResources(t *testing.T) {
+	obj1 := NewPod()
+	obj1.SetNamespace(test.FakeDestNamespace)
+	obj2 := NewPod()
+	obj3 := NewPod()
+	obj3.SetNamespace("kube-system")
+	obj4 := NewPod()
+	obj4.SetGenerateName("my-pod")
+	obj4.SetName("")
+	obj5 := NewPod()
+	obj5.SetName("")
+	obj5.SetGenerateName("my-pod")
+
+	app := newFakeApp()
+	data := fakeData{
+		manifestResponse: &apiclient.ManifestResponse{
+			Manifests: []string{toJSON(t, obj1), toJSON(t, obj2), toJSON(t, obj3), toJSON(t, obj4), toJSON(t, obj5)},
+			Namespace: test.FakeDestNamespace,
+			Server:    test.FakeClusterURL,
+			Revision:  "abc123",
+		},
+		managedLiveObjs: map[kube.ResourceKey]*unstructured.Unstructured{
+			kube.GetResourceKey(obj1): obj1,
+			kube.GetResourceKey(obj3): obj3,
+		},
+	}
+
+```
