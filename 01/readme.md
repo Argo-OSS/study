@@ -1101,3 +1101,479 @@ sequenceDiagram
     Controller-->RefreshQueue: End process
 
 ```
+
+---
+
+# processAppRefreshItem 분석
+
+이제 app 생성을 관측하는 부분까지 도달했다. 이번에는 어떻게 application 동기화를 하는 지 살펴보자.
+
+믈론 코드는 이 부분에서 시작한다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1550C1-L1550C85
+func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext bool) {
+	// ...
+}
+```
+
+분석한 부분을 다시 가져오자. 이 코드의 세부 사항을 해체해보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1550C1-L1550C85
+func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext bool) {
+	// ...
+	
+	// app이 refresh를 해야하는지 점검
+	// ✅ 체크포인트 1번
+	needRefresh, refreshType, comparisonLevel := ctrl.needRefreshAppStatus(origApp, ctrl.statusRefreshTimeout, ctrl.statusHardRefreshTimeout)
+	// ...
+}
+```
+
+가장 먼저 k8s object가 controller informer 레벨까지 cache 동기화가 되면 `needRefreshAppStatus` 함수가 호출된다. 해당 함수 내부는 다음과 같다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L1776
+func (ctrl *ApplicationController) needRefreshAppStatus(app *appv1.Application, statusRefreshTimeout, statusHardRefreshTimeout time.Duration) (bool, appv1.RefreshType, CompareWith) {
+	logCtx := getAppLog(app)
+	var reason string
+	compareWith := CompareWithLatest
+	refreshType := appv1.RefreshTypeNormal
+
+	softExpired := app.Status.ReconciledAt == nil || app.Status.ReconciledAt.Add(statusRefreshTimeout).Before(time.Now().UTC())
+	hardExpired := (app.Status.ReconciledAt == nil || app.Status.ReconciledAt.Add(statusHardRefreshTimeout).Before(time.Now().UTC())) && statusHardRefreshTimeout.Seconds() != 0
+
+	// 만약 IsRefreshRequested인 경우, 즉 refresh가 요청된 경우
+	// 명시적으로 요청된 경우
+	if requestedType, ok := app.IsRefreshRequested(); ok {
+		compareWith = CompareWithLatestForceResolve
+		// user requested app refresh.
+		refreshType = requestedType
+		reason = fmt.Sprintf("%s refresh requested", refreshType) // 갱신
+	} else { // 명시적 호출이 아닌 경우
+		if !currentSourceEqualsSyncedSource(app) { // 현재 source가 synced source와 같지 않은 경우
+			reason = "spec.source differs" // 갱신
+			compareWith = CompareWithLatestForceResolve
+			if app.Spec.HasMultipleSources() {
+				reason = "at least one of the spec.sources differs"
+			}
+		} else if hardExpired || softExpired { // 시간으로 인한 갱신인 경우
+			// The commented line below mysteriously crashes if app.Status.ReconciledAt is nil
+			// reason = fmt.Sprintf("comparison expired. reconciledAt: %v, expiry: %v", app.Status.ReconciledAt, statusRefreshTimeout)
+			// TODO: find existing Golang bug or create a new one
+			reconciledAtStr := "never"
+			if app.Status.ReconciledAt != nil {
+				reconciledAtStr = app.Status.ReconciledAt.String()
+			}
+			reason = fmt.Sprintf("comparison expired, requesting refresh. reconciledAt: %v, expiry: %v", reconciledAtStr, statusRefreshTimeout)
+			if hardExpired {
+				reason = fmt.Sprintf("comparison expired, requesting hard refresh. reconciledAt: %v, expiry: %v", reconciledAtStr, statusHardRefreshTimeout)
+				refreshType = appv1.RefreshTypeHard
+			}
+			// 무언가 그 외 다른 이유들
+		} else if !app.Spec.Destination.Equals(app.Status.Sync.ComparedTo.Destination) {
+			reason = "spec.destination differs"
+		} else if app.HasChangedManagedNamespaceMetadata() {
+			reason = "spec.syncPolicy.managedNamespaceMetadata differs"
+		} else if !app.Spec.IgnoreDifferences.Equals(app.Status.Sync.ComparedTo.IgnoreDifferences) {
+			reason = "spec.ignoreDifferences differs"
+		} else if requested, level := ctrl.isRefreshRequested(app.QualifiedName()); requested {
+			compareWith = level
+			reason = "controller refresh requested"
+		}
+	}
+
+	if reason != "" {
+		logCtx.Infof("Refreshing app status (%s), level (%d)", reason, compareWith)
+		return true, refreshType, compareWith
+	}
+	return false, refreshType, compareWith
+}
+```
+
+많은 분기를 하면서 어떤 원인으로 인해 application의 refresh가 필요한지 분리한다. 
+
+여기서 응답으로 전달하는 값 중 refreshType은 appv1.RefreshType 타입인데, 상수 정의를 확인해보면 아래 타입이 존재하는 것을 확인할 수 있다.
+
+```go
+const (
+	RefreshTypeNormal RefreshType = "normal"
+	RefreshTypeHard   RefreshType = "hard"
+)
+```
+
+또한 compareWith은 다음 값을 가진다.
+
+```go
+const (
+	// Compare live application state against state defined in latest git revision with no resolved revision caching.
+	CompareWithLatestForceResolve CompareWith = 3
+	// Compare live application state against state defined in latest git revision.
+	CompareWithLatest CompareWith = 2
+	// Compare live application state against state defined using revision of most recent comparison.
+	CompareWithRecent CompareWith = 1
+	// Skip comparison and only refresh application resources tree
+	ComparisonWithNothing CompareWith = 0
+)
+```
+
+이해한 바에 따르면 아래와 같다.
+
+- 0: 리소스를 비교하지 않고 트리만 새로고침한다.
+- 1: 배포상태와 git을 이전에 당겨온 캐시된 상태를 비교한다.
+- 2: 배포상태와 git을 당겨온 상태를 비교한다.
+- 3: 캐싱은 신경쓰지 않고 git을 당겨온 상태와 비교한다(?)
+
+아래 다이어그램은 리프레싱에 대한 과정을 추적하는 다이어그램이다.
+
+```mermaid
+flowchart TD
+    Start(["Start"])
+    InitVars["Initialize Variables:<br>compareWith = CompareWithLatest,<br>refreshType = Normal"]
+    IsRefreshRequested["Is app.IsRefreshRequested()?"]
+    SpecDiffers["Does spec.source differ?"]
+    Expired["Is app softExpired or hardExpired?"]
+    HardExpired["Is it hardExpired?"]
+    DestDiffers["Does spec.destination differ from status.destination?"]
+    MetadataDiffers["Does managedNamespaceMetadata differ?"]
+    IgnoreDiffers["Does spec.ignoreDifferences differ?"]
+    CtrlRefreshRequested["Is refresh requested by controller?"]
+
+    LogReason["Log reason"]
+    ReturnTrue["Return true,<br>refreshType,<br>compareWith"]
+    ReturnFalse["Return false,<br>refreshType,<br>compareWith"]
+
+    Start --> InitVars
+    InitVars --> IsRefreshRequested
+    IsRefreshRequested -->|Yes| SetForceResolve["Set compareWith = ForceResolve<br>Set refreshType = requestedType"] --> LogReason
+    IsRefreshRequested -->|No| SpecDiffers
+    SpecDiffers -->|Yes| SetForceResolveAgain["Set compareWith = ForceResolve"] --> LogReason
+    SpecDiffers -->|No| Expired
+    Expired -->|Yes| HardExpired
+    HardExpired -->|Yes| SetHardRefresh["Set refreshType = Hard"] --> LogReason
+    HardExpired -->|No| LogReason
+    Expired -->|No| DestDiffers
+    DestDiffers -->|Yes| LogReason
+    DestDiffers -->|No| MetadataDiffers
+    MetadataDiffers -->|Yes| LogReason
+    MetadataDiffers -->|No| IgnoreDiffers
+    IgnoreDiffers -->|Yes| LogReason
+    IgnoreDiffers -->|No| CtrlRefreshRequested
+    CtrlRefreshRequested -->|Yes| SetForceResolveByCtrl["Set compareWith = requested level"] --> LogReason
+    CtrlRefreshRequested -->|No| ReturnFalse
+    LogReason --> ReturnTrue
+```
+
+refresh가 필요하지 않은 application은 무시된다. 그러니까 `needRefreshAppStatus` 함수 이후는 무조건 refresh가 된다는 것이 보장된다. 다음 분기는 comparisonLevel에 따라 로직이 처리된다. 
+
+```go
+// ...
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1611
+	if comparisonLevel == ComparisonWithNothing {
+		managedResources := make([]*appv1.ResourceDiff, 0)
+		if err := ctrl.cache.GetAppManagedResources(app.InstanceName(ctrl.namespace), &managedResources); err != nil {
+			// ...
+		} else { // ctrl.cache.GetAppManagedResources에서 에러가 없는 경우 managedResources에 원소가 들어갈 것으로 예상
+			var tree *appv1.ApplicationTree
+			// managedResources로부터 트리 가져오기
+			if tree, err = ctrl.getResourceTree(app, managedResources); err == nil {
+				app.Status.Summary = tree.GetSummary(app)
+				// 캐시에 리소스 트리 정보 저장
+				if err := ctrl.cache.SetAppResourcesTree(app.InstanceName(ctrl.namespace), tree); err != nil {
+					logCtx.Errorf("Failed to cache resources tree: %v", err)
+					return
+				}
+			}
+			// app 상태 저장
+			patchMs = ctrl.persistAppStatus(origApp, &app.Status)
+			return
+		}
+	}
+
+```
+
+위 코드를 확인해보면 ComparisonNothing, 즉, 비교하지 않는 상태인 경우 다음 로직을 따른다. 
+
+1. app이 관리하는 리소스를 조회
+2. managedResources로부터 트리 생성
+3. 트리 정보 저장
+4. app 상태 저장
+
+ 다음은 app condition을 갱신하는 부분이다. 여기서 실제 refresh가 일어나는지는 모르겠다.
+
+```go
+// ...
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1631
+	project, hasErrors := ctrl.refreshAppConditions(app)
+```
+
+함수의 정의는 다음과 같다. 
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1829
+func (ctrl *ApplicationController) refreshAppConditions(app *appv1.Application) (*appv1.AppProject, bool) {
+	errorConditions := make([]appv1.ApplicationCondition, 0)
+	proj, err := ctrl.getAppProj(app) // 프로젝트 조회
+	if err != nil {
+		// 에러뜨면 에러 errorConditions에 에러 컨디션 집어넣음
+		errorConditions = append(errorConditions, ctrl.projectErrorToCondition(err, app))
+	} else {
+		// ValidatePermission함수는 app 배포 형식을 검증. argocd에 포함된 클러스터인지? repo는 접근 가능한지? 이런 대상 검증
+		// specConditions가 비어있어야 error가 없는 것
+		specConditions, err := argo.ValidatePermissions(context.Background(), &app.Spec, proj, ctrl.db)
+		if err != nil {
+			errorConditions = append(errorConditions, appv1.ApplicationCondition{
+				Type:    appv1.ApplicationConditionUnknownError,
+				Message: err.Error(),
+			})
+		} else {
+			errorConditions = append(errorConditions, specConditions...)
+		}
+	}
+	app.Status.SetConditions(errorConditions, map[appv1.ApplicationConditionType]bool{
+		appv1.ApplicationConditionInvalidSpecError: true,
+		appv1.ApplicationConditionUnknownError:     true,
+	})
+	
+	// errorConditions값이 없어야 함. 참이라면 뭔가 문제있는 것. project가 올바르게 리턴되어야 함
+	return proj, len(errorConditions) > 0
+}
+```
+
+함수 정의를 확인했을 때 argocd app server의 refresh버튼 누르는 것과는 동작이 다른 것 같다. app condition을 확인하여 문제 유무 검사만 하는 것 같다.
+
+다음 코드는 multiple sources에 대한 처리이다. 
+
+- multiple이면 루프를 돌고
+- 아니면 안 돈다.
+
+이 정도 차이다.
+
+```go
+	// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1662
+	if hasMultipleSources {
+		for _, source := range app.Spec.Sources {
+			// We do not perform any filtering of duplicate sources.
+			// Argo CD will apply and update the resources generated from the sources automatically
+			// based on the order in which manifests were generated
+			sources = append(sources, source)
+			revisions = append(revisions, source.TargetRevision)
+		}
+		if comparisonLevel == CompareWithRecent {
+			revisions = app.Status.Sync.Revisions
+		}
+	} else {
+		revision := app.Spec.GetSource().TargetRevision
+		if comparisonLevel == CompareWithRecent {
+			revision = app.Status.Sync.Revision
+		}
+		revisions = append(revisions, revision)
+		sources = append(sources, app.Spec.GetSource())
+	}
+```
+
+이 다음 코드가 바로 앱 상태를 비교하는 코드이다.
+
+```go
+	compareResult, err := ctrl.appStateManager.CompareAppState(app, project, revisions, sources,
+	refreshType == appv1.RefreshTypeHard,
+	comparisonLevel == CompareWithLatestForceResolve, localManifests, hasMultipleSources, false)
+```
+
+해당 코드는 appStateManager라는 인터페이스의 CompareAppState라는 메서드 호출이다. 이 인터페이스 메서드 구현에 대한 정의는 다음과 같다. 한 400줄 정도 된다. 잘 읽어보자.
+
+코드가 너무 길다. err에 대한 처리는 당장은 무시하고 진행하자. 세세하게 다루다가 아무것도 못한다. 이 함수는 너무 길어서 나눠서 분석한다. gitops를 구현하는 함수이다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/state.go#L432
+func (m *appStateManager) CompareAppState( ... ) (*comparisonResult, error) {
+	// ...
+}
+```
+
+다음은 레거시 필드 마이그레이션이다. 내부 함수 주석을 확인하면 그렇게 쓰여있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L1696
+	ctrl.normalizeApplication(origApp, app)
+```
+
+다음으로 리소스 diff목록을 만들고 관련 데이터를 캐싱하고 tree를 리턴하는 과정을 수행한다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L1699C1-L1699C62
+	tree, err := ctrl.setAppManagedResources(app, compareResult)
+	
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L459
+// setAppManagedResources will build a list of ResourceDiff based on the provided comparisonResult
+// and persist app resources related data in the cache. Will return the persisted ApplicationTree.
+func (ctrl *ApplicationController) setAppManagedResources(a *appv1.Application, comparisonResult *comparisonResult) (*appv1.ApplicationTree, error) {
+	// ...
+	managedResources, err := ctrl.hideSecretData(a, comparisonResult) // managedResources를 가져오고
+	ts.AddCheckpoint("hide_secret_data_ms")
+	if err != nil {
+		return nil, fmt.Errorf("error getting managed resources: %w", err)
+	}
+	tree, err := ctrl.getResourceTree(a, managedResources) // 리소스 트리 가져오고
+	ts.AddCheckpoint("get_resource_tree_ms")
+	if err != nil {
+		return nil, fmt.Errorf("error getting resource tree: %w", err)
+	}
+	err = ctrl.cache.SetAppResourcesTree(a.InstanceName(ctrl.namespace), tree) // 리소스 트리 캐싱하고
+	ts.AddCheckpoint("set_app_resources_tree_ms")
+	if err != nil {
+		return nil, fmt.Errorf("error setting app resource tree: %w", err)
+	}
+	err = ctrl.cache.SetAppManagedResources(a.InstanceName(ctrl.namespace), managedResources) // 리소스 캐싱하고
+	ts.AddCheckpoint("set_app_managed_resources_ms")
+	if err != nil {
+		return nil, fmt.Errorf("error setting app managed resources: %w", err)
+	}
+	return tree, nil // 트리 리턴
+}
+```
+
+다음은 sync와 관련된 부분이다. sync가능 상태를 확인하고 동기화를 실행한다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L1707
+	canSync, _ := project.Spec.SyncWindows.Matches(app).CanSync(false)
+	if canSync {
+		// sync가 가능하다면 autoSync
+		syncErrCond, opMS := ctrl.autoSync(app, compareResult.syncStatus, compareResult.resources, compareResult.revisionUpdated)
+		if syncErrCond != nil { // 에러 처리
+			// ...
+		}
+	} else { // 동기화가 차단된 경우로 보임
+		logCtx.Info("Sync prevented by sync window")
+	}
+	ts.AddCheckpoint("auto_sync_ms")
+```
+
+여기서 autoSync함수가 중요해보인다. 이 부분도 에러처리는 당장은 건너간다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/controller/appcontroller.go#L1932
+// autoSync will initiate a sync operation for an application configured with automated sync
+func (ctrl *ApplicationController) autoSync(app *appv1.Application, syncStatus *appv1.SyncStatus, resources []appv1.ResourceStatus, revisionUpdated bool) (*appv1.ApplicationCondition, time.Duration) {
+	// ...
+	
+	// sync policy 검증
+	if app.Spec.SyncPolicy == nil || app.Spec.SyncPolicy.Automated == nil {
+		return nil, 0
+	}
+
+	// ...
+
+	// prune 비활성화인 경우
+	if !app.Spec.SyncPolicy.Automated.Prune {
+		requirePruneOnly := true
+		for _, r := range resources { // 모든 리소스를 순회하면서 리소스 상태가 SyncStatusCodeSynced가 아니면서 RequiresPruning이 아니면
+			if r.Status != appv1.SyncStatusCodeSynced && !r.RequiresPruning {
+				requirePruneOnly = false // 해당 분기 탈출(자세한 의미는 모르겠음)
+				break
+			}
+		}
+		if requirePruneOnly {
+			logCtx.Infof("Skipping auto-sync: need to prune extra resources only but automated prune is disabled")
+			return nil, 0
+		}
+	}
+
+	// selfHeal이 꺼져있으면 revision상태가 동일할 때 sync를 무시
+	selfHeal := app.Spec.SyncPolicy.Automated.SelfHeal
+	// Multi-Source Apps with selfHeal disabled should not trigger an autosync if
+	// the last sync revision and the new sync revision is the same.
+	if app.Spec.HasMultipleSources() && !selfHeal && reflect.DeepEqual(app.Status.Sync.Revisions, syncStatus.Revisions) {
+		logCtx.Infof("Skipping auto-sync: selfHeal disabled and sync caused by object update")
+		return nil, 0
+	}
+
+	// 이미 sync된 상태인지 확인
+	desiredCommitSHA := syncStatus.Revision
+	desiredCommitSHAsMS := syncStatus.Revisions
+	alreadyAttempted, attemptPhase := alreadyAttemptedSync(app, desiredCommitSHA, desiredCommitSHAsMS, app.Spec.HasMultipleSources(), revisionUpdated)
+	ts.AddCheckpoint("already_attempted_sync_ms")
+	op := appv1.Operation{
+		Sync: &appv1.SyncOperation{
+			Revision:    desiredCommitSHA,
+			Prune:       app.Spec.SyncPolicy.Automated.Prune,
+			SyncOptions: app.Spec.SyncPolicy.SyncOptions,
+			Revisions:   desiredCommitSHAsMS,
+		},
+		InitiatedBy: appv1.OperationInitiator{Automated: true},
+		Retry:       appv1.RetryStrategy{Limit: 5},
+	}
+	if app.Status.OperationState != nil && app.Status.OperationState.Operation.Sync != nil {
+		op.Sync.SelfHealAttemptsCount = app.Status.OperationState.Operation.Sync.SelfHealAttemptsCount
+	}
+	if app.Spec.SyncPolicy.Retry != nil {
+		op.Retry = *app.Spec.SyncPolicy.Retry
+	}
+	// It is possible for manifests to remain OutOfSync even after a sync/kubectl apply (e.g.
+	// auto-sync with pruning disabled). We need to ensure that we do not keep Syncing an
+	// application in an infinite loop. To detect this, we only attempt the Sync if the revision
+	// and parameter overrides are different from our most recent sync operation.
+	// 이미 적용된 경우
+	if alreadyAttempted && (!selfHeal || !attemptPhase.Successful()) {
+		if !attemptPhase.Successful() {
+			// ...
+		}
+		logCtx.Infof("Skipping auto-sync: most recent sync already to %s", desiredCommitSHA)
+		return nil, 0
+	// 이미 적용됐는데 selfHeal이 활성화된 경우
+	} else if alreadyAttempted && selfHeal {
+		if shouldSelfHeal, retryAfter := ctrl.shouldSelfHeal(app); shouldSelfHeal {
+			op.Sync.SelfHealAttemptsCount++
+			for _, resource := range resources {
+				if resource.Status != appv1.SyncStatusCodeSynced {
+					op.Sync.Resources = append(op.Sync.Resources, appv1.SyncOperationResource{
+						Kind:  resource.Kind,
+						Group: resource.Group,
+						Name:  resource.Name,
+					})
+				}
+			}
+		} else {
+			logCtx.Infof("Skipping auto-sync: already attempted sync to %s with timeout %v (retrying in %v)", desiredCommitSHA, ctrl.selfHealTimeout, retryAfter)
+			ctrl.requestAppRefresh(app.QualifiedName(), CompareWithLatest.Pointer(), &retryAfter)
+			return nil, 0
+		}
+	}
+	ts.AddCheckpoint("already_attempted_check_ms")
+
+	// prune이 활성화 and alloyempty가 비활성화에서 모든 리소스가 RequiresPruning이 false라면 에러
+	if app.Spec.SyncPolicy.Automated.Prune && !app.Spec.SyncPolicy.Automated.AllowEmpty {
+		bAllNeedPrune := true
+		for _, r := range resources {
+			if !r.RequiresPruning {
+				bAllNeedPrune = false
+			}
+		}
+		if bAllNeedPrune {
+			message := fmt.Sprintf("Skipping sync attempt to %s: auto-sync will wipe out all resources", desiredCommitSHA)
+			logCtx.Warn(message)
+			return &appv1.ApplicationCondition{Type: appv1.ApplicationConditionSyncError, Message: message}, 0
+		}
+	}
+
+	// application update: argo.SetAppOperation에서 리소스 업데이트
+	appIf := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(app.Namespace)
+	ts.AddCheckpoint("get_applications_ms")
+	start := time.Now()
+	updatedApp, err := argo.SetAppOperation(appIf, app.Name, &op)
+	ts.AddCheckpoint("set_app_operation_ms")
+	setOpTime := time.Since(start)
+	if err != nil {
+		// ...
+	} else {
+		ctrl.writeBackToInformer(updatedApp)
+	}
+	// ...
+	return nil, setOpTime
+}
+
+```
+
+이후 app status를 compareResult 필드로 변경하고 마무리. 이렇게 하면 `processAppRefreshQueueItem`의 동작을 모두 살펴봤다. 그러나 아직 살펴보지 않은 부분이 하나 있는데 CompareAppState이 함수 동작을 이제부터 살펴보자.
