@@ -1854,3 +1854,135 @@ func TestCompareAppStateDuplicatedNamespacedResources(t *testing.T) {
 	}
 
 ```
+
+---
+
+# processAppRefreshQueueItem의 최하층
+
+지금까지 확인한 코드를 살펴보면 applications의 상태를 가져와 원격 저장소와 비교하고 sync할 대상을 탐색하여 app을 갱신하는 코드까지 확인했다. 이제는 갱신된 app을 통하여 어떻게 k8s 리소스가 생성되는지 비교해보도록 하자.
+
+그러면 다시 processAppRefreshQueueItem을 살펴보자.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1550C1-L1550C85
+func (ctrl *ApplicationController) processAppRefreshQueueItem() (processNext bool) {
+	// ...
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("Recovered from panic: %+v\n%s", r, debug.Stack())
+		}
+		// We want to have app operation update happen after the sync, so there's no race condition
+		// and app updates not proceeding. See https://github.com/argoproj/argo-cd/issues/18500.
+		ctrl.appOperationQueue.AddRateLimited(appKey)
+		ctrl.appRefreshQueue.Done(appKey)
+	}()
+	// ...
+```
+
+이 부분은 refreshQueue를 확인할 때 지나쳤던 부분이다. defer로 함수 내에서 제일 나중에 호출되는 부분인데, 이 부분을 잠시 확인해보자. 이 부분에서 자세히 보면 `ctrl.appOperationQueue.AddRateLimited(appKey)` 이 부분이 있다. 이 부분은 appOperationQueue로 appKey를 전달한다. queue에 원소를 publish하고 있으므로 어디선가 subscribe해야 한다. 이 subscribe함수의 구현은 여기에 있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L933C1-L933C87
+func (ctrl *ApplicationController) processAppOperationQueueItem() (processNext bool) {
+	// queue data 가져오기
+	appKey, shutdown := ctrl.appOperationQueue.Get() 
+	
+	// ...
+	
+	processNext = true
+	
+	// ...
+
+	// informer에서 obj 조회
+	obj, exists, err := ctrl.appInformer.GetIndexer().GetByKey(appKey)
+	
+	// ...
+	
+	origApp, ok := obj.(*appv1.Application)
+	
+	// ...
+	
+	app := origApp.DeepCopy()
+	
+	// ...
+
+	if app.Operation != nil {
+		// If we get here, we are about to process an operation, but we cannot rely on informer since it might have stale data.
+		// So always retrieve the latest version to ensure it is not stale to avoid unnecessary syncing.
+		// We cannot rely on informer since applications might be updated by both application controller and api server.
+		// 최신 정보 갱신을 위한 리프레시
+		freshApp, err := ctrl.applicationClientset.ArgoprojV1alpha1().Applications(app.ObjectMeta.Namespace).Get(context.Background(), app.ObjectMeta.Name, metav1.GetOptions{})
+		
+		// ...
+		
+		app = freshApp
+	}
+
+	if app.Operation != nil {
+		ctrl.processRequestedAppOperation(app)
+		
+		// ...
+		
+	} 
+	
+	// ...
+	
+	return
+}
+```
+
+여기서는 하는 게 별로 없다. obj 가져와서 `processRequesteAppOperation` 에 app을 던진다. 그럼 저 함수를 탐색해야 한다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/appcontroller.go#L1326C1-L1451C2
+func (ctrl *ApplicationController) processRequestedAppOperation(app *appv1.Application) {
+	
+	// ...
+	
+	if isOperationInProgress(app) {
+		// 이미 진행중일 때
+	} else {
+		state = &appv1.OperationState{Phase: synccommon.OperationRunning, Operation: *app.Operation, StartedAt: metav1.Now()}
+		ctrl.setOperationState(app, state) // app state 변경
+		// ...
+	}
+	
+	// ...
+	// 목적지 검증
+	if err := argo.ValidateDestination(context.Background(), &app.Spec.Destination, ctrl.db); err != nil {
+		// ...
+	} else {
+		// 실제 app sync 진행
+		ctrl.appStateManager.SyncAppState(app, state)
+	}
+	
+	// ...
+}
+```
+
+여기도 정상 생성 과정에서는 크게 볼 부분은 없다. 검증 → 생성 → 생성 이후 상태에 따른 처리로 로직이 진행된다. 실제 생성은 `ctrl.appStateManager.SyncAppState(app, state)` 이 위치에서 일어난다. 이 부분은 CompareAppState처럼 manager가 호출한다. 실제 구현체인 메서드는 다음과 같다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/8f0d3d0f6ad5b0cc94c704ec2fd2c26fa97d8202/controller/sync.go#L95
+func (m *appStateManager) SyncAppState(app *v1alpha1.Application, state *v1alpha1.OperationState) {
+	
+	// 굉장히 긴 초기화 작업과 세팅 작업 진행
+	// ...
+
+	// 이 부분에서 실제 sync작업 수행
+	if state.Phase == common.OperationTerminating {
+		syncCtx.Terminate()
+	} else {
+		syncCtx.Sync()
+	}
+	
+	// ...
+	// 결과 받아서 처리하는 부분
+}
+```
+
+함수는 엄청나게 길게 있는데 app 생성만 최우선으로 살펴보면 이 함수에서 살펴볼 부분은 `syncCtx.sync()` 이 유일하다. 그러나 이 부분의 코드는 argocd 자체의 코드가 아니다. 그럼 어디에 있는 코드인가? argocd의 코드가 아닌, gitops-engine의 코드이다. gitops-engine은 여기서 확인 가능하다.
+
+https://github.com/argoproj/gitops-engine
+
+그럼 이번에는 gitops engine의 코드를 살펴보자.
