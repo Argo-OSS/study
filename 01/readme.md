@@ -119,6 +119,101 @@ flangdu@DESKTOP-SPRNMEM:/mnt/c/Users/dx/work-root/pr
 
 ---
 
+# cli login과 cli가 연결하는 대상 찾기
+
+argocd cli를 이용하기 위해서는 다음 명령으로 로그인해야 한다.
+
+```sh
+argocd login
+# Log in to Argo CD
+
+# Usage:
+#   argocd login SERVER [flags]
+
+# Examples:
+# # Login to Argo CD using a username and password
+# argocd login cd.argoproj.io
+```
+
+argocd login을 호출하면 login에 대한 hint를 확인할 수 있다. argocd 프로젝트 내부에서 `Log in to Argo CD`를 검색하면 login을 관리하는 부분을 찾을 수 있다.
+
+```go
+// https://github.com/argoproj/argo-cd/blob/96d0226a4963d9639aea81ec1d3a310fed390133/cmd/argocd/commands/login.go#L37
+// NewLoginCommand returns a new instance of `argocd login` command
+func NewLoginCommand(globalClientOpts *argocdclient.ClientOptions) *cobra.Command {
+	var (
+		ctxName          string
+		username         string
+		password         string
+		sso              bool
+		ssoPort          int
+		skipTestTLS      bool
+		ssoLaunchBrowser bool
+	)
+	command := &cobra.Command{
+		Use:   "login SERVER",
+		Short: "Log in to Argo CD",
+		Long:  "Log in to Argo CD",
+		Example: `# Login to Argo CD using a username and password
+argocd login cd.argoproj.io
+
+# Login to Argo CD using SSO
+argocd login cd.argoproj.io --sso
+
+# Configure direct access using Kubernetes API server
+argocd login cd.argoproj.io --core`,
+		Run: func(c *cobra.Command, args []string) {
+
+			// ...
+
+		},
+	}
+	
+	// ...
+
+	return command
+}
+```
+
+이 함수 내에 command를 만들고 command를 리턴하는 부분이 있다. 여기서 Run메서드가 어떤 로직을 처리하고 var에 선언된 변수를 이용한다고 추측할 수 있다.
+
+`argocd login` 명령은 hint에서 `argocd login cd.argoproj.io`와 같이 서버인 cd.argoproj.io를 명시하고 있다.
+
+그럼 server는 어떻게 받아오는 것인가? 이 동작은 Run 내부에서 받아오는 로직으로 구현되어 있다. Run 내부 코드를 확인하자. 
+
+```go
+		Run: func(c *cobra.Command, args []string) {
+
+			// ...
+
+			if globalClientOpts.PortForward {
+				server = "port-forward"
+			} else if globalClientOpts.Core {
+				server = "kubernetes"
+			} else {
+				server = args[0]
+
+				// ...
+				
+			}
+
+			// ...
+
+		},
+```
+
+run 내부에는 server를 `args[0]`라는 값으로 받아오는 것을 확인할 수 있다. 이 args는 cobra에 명령어를 전달할 때 옆에 붙이는 인자를 의미한다.
+
+예를 들어 login 명령의 경우, `args[0]`는 다음이 된다.
+
+```sh
+argocd login args[0]
+```
+
+즉, `args[0]`는 argocd login시 접속하는 서버를 의미한다. argocd cli를 이용하기 위해서 argocd api server에 대한 주소를 `args[0]`로 전달하는데, 앞으로 사용할 모든 명령에는 argocd api server에 login된 상태가 될 것임을 알 수 있다.
+
+---
+
 # cli app 생성 동작
 
 cli 코드는 가장 먼저 root.go에서 확인할 수 있다.
