@@ -15,3 +15,320 @@
 - 모든 이벤트를 수신하거나 필터링하는지, 이를 통해 성능 저하를 방지하는 기법은 무엇인지.
 - 변경 이벤트를 기반으로 UI 업데이트가 발생하는 전체 흐름 분석.
 
+## application의 리소스 
+애플리케이션의 리소스 정보를 보면 상태 값에 Argo 애플리케이션을 통해 관리되고 있는 리소스 정보를 확인할 수 있다. 
+이말은 application controller가 상태 값을 업데이트 해주는 것으로 이해가 되는데 
+이 정보를 UI에서 어떻게 가져오고 처리하고 있는지를 확인해보고자 한다. 
+
+application 리소스 예시 
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  creationTimestamp: "2025-01-14T15:05:00Z"
+  generation: 4
+  name: app
+  namespace: argocd
+  resourceVersion: "2788"
+  uid: af626036-51e8-4365-8535-5a0a23746d87
+spec:
+  destination:
+    namespace: default
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: kustomize-guestbook
+    repoURL: https://github.com/argoproj/argocd-example-apps
+    targetRevision: HEAD
+status:
+  controllerNamespace: argocd
+  health:
+    status: Missing
+  reconciledAt: "2025-01-14T15:05:57Z"
+  resources: # 이 앱이 관리하는 app에 대한 정보가 담겨있음 
+  - health:
+      status: Missing
+    kind: Service
+    name: kustomize-guestbook-ui
+    namespace: default
+    status: OutOfSync
+    version: v1
+  - group: apps
+    health:
+      status: Missing
+    kind: Deployment
+    name: kustomize-guestbook-ui
+    namespace: default
+    status: OutOfSync
+    version: v1
+  sourceType: Kustomize
+  summary: {}
+  sync:
+    comparedTo:
+      destination:
+        namespace: default
+        server: https://kubernetes.default.svc
+      source:
+        path: kustomize-guestbook
+        repoURL: https://github.com/argoproj/argocd-example-apps
+        targetRevision: HEAD
+    revision: d7927a27b4533926b7d86b5f249cd9ebe7625e90
+    status: OutOfSync
+```
+
+먼저 application의 리스트를 가져와서 변경 점이 있는지 확인하는 것 같은 부분은 다음과 같다.
+```typescript
+// https://github.com/argoproj/argo-cd/blob/v2.13.3/ui/src/app/applications/components/applications-list/applications-list.tsx#L54
+function loadApplications(projects: string[], appNamespace: string): Observable<models.Application[]> {
+    return from(services.applications.list(projects, {appNamespace, fields: APP_LIST_FIELDS})).pipe(
+        mergeMap(applicationsList => {
+            const applications = applicationsList.items;
+            return merge(
+                from([applications]),
+                services.applications
+                    // application 리스트의 resourceVersion의 변경을 감시함 
+                    .watch({projects, resourceVersion: applicationsList.metadata.resourceVersion}, {fields: APP_WATCH_FIELDS}) 
+                    .pipe(repeat())
+                    .pipe(retryWhen(errors => errors.pipe(delay(WATCH_RETRY_TIMEOUT))))
+                    // batch events to avoid constant re-rendering and improve UI performance
+                    .pipe(bufferTime(EVENTS_BUFFER_TIMEOUT))
+                    .pipe(
+                        map(appChanges => {
+                            appChanges.forEach(appChange => {
+                                const index = applications.findIndex(item => AppUtils.appInstanceName(item) === AppUtils.appInstanceName(appChange.application));
+                                switch (appChange.type) {
+                                    // App의 변경 상태가 삭제인 경우 처리를 함
+                                    case 'DELETED':
+                                        if (index > -1) {
+                                            applications.splice(index, 1);
+                                        }
+                                        break;
+                                    default:
+                                        if (index > -1) {
+                                            applications[index] = appChange.application;
+                                        } else {
+                                            applications.unshift(appChange.application);
+                                        }
+                                        break;
+                                }
+                            });
+                            return {applications, updated: appChanges.length > 0};
+                        })
+                    )
+                    .pipe(filter(item => item.updated))
+                    .pipe(map(item => item.applications))
+            );
+        })
+    );
+}
+```
+
+좀더 위에 보면 사전에 감시할 필드에 대한 정의가 있음
+```typescript
+// The applications list/watch API supports only selected set of fields.
+// Make sure to register any new fields in the `appFields` map of `pkg/apiclient/application/forwarder_overwrite.go`.
+const APP_FIELDS = [
+    'metadata.name',
+    'metadata.namespace',
+    'metadata.annotations',
+    'metadata.labels',
+    'metadata.creationTimestamp',
+    'metadata.deletionTimestamp',
+    'spec',
+    'operation.sync',
+    'status.sync.status',
+    'status.sync.revision',
+    'status.health',
+    'status.operationState.phase',
+    'status.operationState.finishedAt',
+    'status.operationState.operation.sync',
+    'status.summary',
+    'status.resources'
+];
+const APP_LIST_FIELDS = ['metadata.resourceVersion', ...APP_FIELDS.map(field => `items.${field}`)];
+const APP_WATCH_FIELDS = ['result.type', ...APP_FIELDS.map(field => `result.application.${field}`)];
+
+```
+
+
+watch 코드에 대해서 좀더 살펴 보면 서버로부터 실시간 이벤트를 수신하고 있는것을 알 수 있다. 
+```typescript
+// https://github.com/argoproj/argo-cd/blob/v2.13.3/ui/src/app/shared/services/applications-service.ts#L170
+    public watch(query?: {name?: string; resourceVersion?: string; projects?: string[]; appNamespace?: string}, options?: QueryOptions): Observable<models.ApplicationWatchEvent> {
+        const search = new URLSearchParams();
+        if (query) {
+            if (query.name) {
+                search.set('name', query.name);
+            }
+            if (query.resourceVersion) {
+                search.set('resourceVersion', query.resourceVersion);
+            }
+            if (query.appNamespace) {
+                search.set('appNamespace', query.appNamespace);
+            }
+        }
+        if (options) {
+            const searchOptions = optionsToSearch(options);
+            search.set('fields', searchOptions.fields);
+            search.set('selector', searchOptions.selector);
+            search.set('appNamespace', searchOptions.appNamespace);
+            query?.projects?.forEach(project => search.append('projects', project));
+        }
+        const searchStr = search.toString();
+        const url = `/stream/applications${(searchStr && '?' + searchStr) || ''}`;
+        return requests
+            .loadEventSource(url)
+            .pipe(repeat())
+            .pipe(retry())
+            .pipe(map(data => JSON.parse(data).result as models.ApplicationWatchEvent))
+            .pipe(
+                map(watchEvent => {
+                    watchEvent.application = this.parseAppFields(watchEvent.application);
+                    return watchEvent;
+                });
+            );
+    }
+```
+
+위의 URI를 처리하는 건 아래의 코드
+```golang
+// https://github.com/argoproj/argo-cd/blob/v2.13.3/server/application/application.go#L1162
+func (s *Server) Watch(q *application.ApplicationQuery, ws application.ApplicationService_WatchServer) error {
+	appName := q.GetName()  // 애플리케이션 이름
+	appNs := s.appNamespaceOrDefault(q.GetAppNamespace())  // 애플리케이션 네임스페이스
+	logCtx := log.NewEntry(log.New())
+	if q.Name != nil {
+		logCtx = logCtx.WithField("application", *q.Name)
+	}
+	projects := map[string]bool{}
+	for _, project := range getProjectsFromApplicationQuery(*q) {
+		projects[project] = true
+	}
+	claims := ws.Context().Value("claims")
+	selector, err := labels.Parse(q.GetSelector())
+	if err != nil {
+		return fmt.Errorf("error parsing labels with selectors: %w", err)
+	}
+	minVersion := 0 // 리소스 버전이 있는지 조회 
+	if q.GetResourceVersion() != "" {
+		if minVersion, err = strconv.Atoi(q.GetResourceVersion()); err != nil {
+			minVersion = 0
+		}
+	}
+
+	// sendIfPermitted is a helper to send the application to the client's streaming channel if the
+	// caller has RBAC privileges permissions to view it
+	sendIfPermitted := func(a appv1.Application, eventType watch.EventType) {
+		permitted := s.isApplicationPermitted(selector, minVersion, claims, appName, appNs, projects, a)
+		if !permitted {
+			return
+		}
+		s.inferResourcesStatusHealth(&a)
+        // client에게 이벤트를 전송
+		err := ws.Send(&appv1.ApplicationWatchEvent{
+			Type:        eventType,
+			Application: a,
+		})
+		if err != nil {
+			logCtx.Warnf("Unable to send stream message: %v", err)
+			return
+		}
+	}
+
+	events := make(chan *appv1.ApplicationWatchEvent, watchAPIBufferSize)
+	// Mimic watch API behavior: send ADDED events if no resource version provided
+	// If watch API is executed for one application when emit event even if resource version is provided
+	// This is required since single app watch API is used for during operations like app syncing and it is
+	// critical to never miss events.
+	if q.GetResourceVersion() == "" || q.GetName() != "" {
+        // 리소스 버전이 없었거나 이름이 없었으면 
+		apps, err := s.appLister.List(selector)
+		if err != nil {
+			return fmt.Errorf("error listing apps with selector: %w", err)
+		}
+		sort.Slice(apps, func(i, j int) bool {
+			return apps[i].QualifiedName() < apps[j].QualifiedName()
+		})
+		for i := range apps {
+			sendIfPermitted(*apps[i], watch.Added)
+            // 앱의 이벤트 타입을 생성 (ADDED)로 추가 해서 보냄
+		}
+	}
+
+	unsubscribe := s.appBroadcaster.Subscribe(events) 
+	defer unsubscribe()
+	for {
+		select {
+		case event := <-events:
+			sendIfPermitted(event.Application, event.Type)
+		case <-ws.Context().Done():
+			return nil
+		}
+	}
+}
+```
+
+<참고용>
+```golang
+// pkg/apis/application/v1alpha1/types.go
+// ApplicationWatchEvent contains information about application change.
+type ApplicationWatchEvent struct {
+	Type watch.EventType `json:"type" protobuf:"bytes,1,opt,name=type,casttype=k8s.io/apimachinery/pkg/watch.EventType"`
+
+	// Application is:
+	//  * If Type is Added or Modified: the new state of the object.
+	//  * If Type is Deleted: the state of the object immediately before deletion.
+	//  * If Type is Error: *api.Status is recommended; other types may make sense
+	//    depending on context.
+	Application Application `json:"application" protobuf:"bytes,2,opt,name=application"`
+}
+```
+
+```golang
+// pkg/client/listers/application/v1alpha1/application.go
+// List lists all Applications in the indexer.
+func (s *applicationLister) List(selector labels.Selector) (ret []*v1alpha1.Application, err error) {
+    // 캐시에서 리스트를 갖고오는 것 같음 
+    // 여기서의 캐시는 client-go의 Indexer
+    // https://github.com/kubernetes/sample-controller/blob/master/docs/controller-client-go.md
+	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
+		ret = append(ret, m.(*v1alpha1.Application))
+	})
+	return ret, err
+}
+```
+
+```golang
+//server/application/broadcaster.go
+type subscriber struct {
+	ch      chan *appv1.ApplicationWatchEvent
+	filters []func(*appv1.ApplicationWatchEvent) bool
+}
+
+// ...
+
+// Subscribe forward application informer watch events to the provided channel.
+// The watch events are dropped if no receives are reading events from the channel so the channel must have
+// buffer if dropping events is not acceptable.
+func (b *broadcasterHandler) Subscribe(ch chan *appv1.ApplicationWatchEvent, filters ...func(event *appv1.ApplicationWatchEvent) bool) func() {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	subscriber := &subscriber{ch, filters}
+	b.subscribers = append(b.subscribers, subscriber)
+	return func() {
+		b.lock.Lock()
+		defer b.lock.Unlock()
+		for i := range b.subscribers {
+			if b.subscribers[i] == subscriber {
+				b.subscribers = append(b.subscribers[:i], b.subscribers[i+1:]...)
+				break
+			}
+		}
+	}
+}
+```
+
+ui에서 어떻게 argocd에 등록된 앱에 변경점을 감지하는지 정리해보면
+- argocd ui에서는 resource version을 기반으로 변경을 감지
+- resource version이 변경되었는지에 대해서는 서버로부터 이벤트 스트리밍을 통해 정보를 받음
+
