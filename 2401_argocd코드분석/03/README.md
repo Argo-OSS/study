@@ -390,3 +390,20 @@ https://pkg.go.dev/k8s.io/client-go/tools/cache#NewSharedIndexInformer
 lister는 캐시에서 가져와서 앱의 정보를 클라이언트에 전달하는 방식이다.
 
 
+추가적으로 아래의 코드내용을 보면 argocd는 애플리케이션에 달려있는 라벨과 어노테이션을 갖고 등록되어있는 클러스터를 감시합니다. 
+```golang
+// https://github.com/argoproj/argo-cd/blob/v2.13.3/controller/cache/cache.go#L773
+
+// Run watches for resource changes annotated with application label on all registered clusters and schedule corresponding app refresh.
+func (c *liveStateCache) Run(ctx context.Context) error {
+	go c.watchSettings(ctx)
+
+	kube.RetryUntilSucceed(ctx, clustercache.ClusterRetryTimeout, "watch clusters", logutils.NewLogrusLogger(logutils.NewWithCurrentConfig()), func() error {
+		return c.db.WatchClusters(ctx, c.handleAddEvent, c.handleModEvent, c.handleDeleteEvent)
+	})
+
+	<-ctx.Done()
+	c.invalidate(c.cacheSettings)
+	return nil
+}
+```
