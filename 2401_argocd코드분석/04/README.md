@@ -3,6 +3,7 @@
 ## 4회차 목표
 * repository 생성 후 흐름
 * Application 생성 UI에서 헬름 차트 값 불러오는 원리
+* git clone은 언제?
 
 ## repository 생성 후 흐름
 
@@ -182,6 +183,8 @@ rpc GetAppDetails(RepoAppDetailsQuery) returns (repository.RepoAppDetailsRespons
 func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppDetailsQuery) (*apiclient.RepoAppDetailsResponse, error) {
 	res := &apiclient.RepoAppDetailsResponse{}
 
+    // 📌 cacheFn: 캐시에 저장되어있다면 캐시에서 조회에서 사용할 수 있도록 하는 함수. cache의 GetAppDetails 함수를 호출한다.
+    // 📌 operation: 배포 타입에 따라 (helm, kustomize 등) 정보를 가져오는 함수
 	cacheFn := s.createGetAppDetailsCacheHandler(res, q)
 	operation := func(repoRoot, commitSHA, revision string, ctxSrc operationContextSrc) error {
 		opContext, err := ctxSrc()
@@ -218,20 +221,20 @@ func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppD
 	}
 
 	settings := operationSettings{allowConcurrent: q.Source.AllowsConcurrentProcessing(), noCache: q.NoCache, noRevisionCache: q.NoCache || q.NoRevisionCache}
+    // 📌 cacheFn, operation 등의 함수를 넘겨서 runRepoOperation 함수 내에서 주요 로직을 수행함
 	err := s.runRepoOperation(ctx, q.Source.TargetRevision, q.Repo, q.Source, false, cacheFn, operation, settings, len(q.RefSources) > 0, q.RefSources)
 
 	return res, err
 }
 ```
 
+createGetAppDetailsCacheHandler 함수를 타고 들어가면 아래와 같은 로직을 확인할 수 있다. 결국 캐시에서 키를 통해 값을 가져오는 로직.
 ```go
 // 🔗 reposerver/cache/cache.go
 func (c *Cache) GetAppDetails(revision string, appSrc *appv1.ApplicationSource, srcRefs appv1.RefTargetRevisionMapping, res *apiclient.RepoAppDetailsResponse, trackingMethod appv1.TrackingMethod, refSourceCommitSHAs ResolvedRevisions) error {
 	return c.cache.GetItem(appDetailsCacheKey(revision, appSrc, srcRefs, trackingMethod, refSourceCommitSHAs), res)
 }
-```
 
-```go
 // 🔗 reposerver/cache/cache.go
 func appDetailsCacheKey(revision string, appSrc *appv1.ApplicationSource, srcRefs appv1.RefTargetRevisionMapping, trackingMethod appv1.TrackingMethod, refSourceCommitSHAs ResolvedRevisions) string {
 	if trackingMethod == "" {
@@ -239,9 +242,7 @@ func appDetailsCacheKey(revision string, appSrc *appv1.ApplicationSource, srcRef
 	}
 	return fmt.Sprintf("appdetails|%s|%d|%s", revision, appSourceKey(appSrc, srcRefs, refSourceCommitSHAs), trackingMethod)
 }
-```
 
-```go
 // 🔗 util/cache/cache.go
 func (c *Cache) GetItem(key string, item any) error {
 	key = c.generateFullKey(key)
@@ -252,7 +253,84 @@ func (c *Cache) GetItem(key string, item any) error {
 	return client.Get(key, item)
 }
 ```
+
+다양한 캐시를 사용하는데, 이중에서 어떤 캐시에서 가져오는지는 확인 못해봄
 ![goal](./image/3_cache_client_interface.png)
+
+
+지정한 레파지토리에 존재하는 헬름의 values.yaml 값을 파싱하여 헬름 파라미터 값에 넣는다.
+```go
+// 🔗 reposerver/repository/repository.go
+func populateHelmAppDetails(res *apiclient.RepoAppDetailsResponse, appPath string, repoRoot string, q *apiclient.RepoServerAppDetailsQuery, gitRepoPaths io.TempPaths) error {
+	var selectedValueFiles []string // 📌 사용자가 지정한 values file
+	var availableValueFiles []string // 📌 레파지토리에 존재하는 values file
+
+	if q.Source.Helm != nil {
+		selectedValueFiles = q.Source.Helm.ValueFiles
+	}
+
+    // 📌 appPath 경로에서 values file을 찾고 availableValueFiles에 저장
+	err := filepath.Walk(appPath, walkHelmValueFilesInPath(appPath, &availableValueFiles))
+	if err != nil {
+		return err
+	}
+
+	res.Helm = &apiclient.HelmAppSpec{ValueFiles: availableValueFiles}
+	var version string
+	var passCredentials bool
+	if q.Source.Helm != nil {
+		if q.Source.Helm.Version != "" {
+			version = q.Source.Helm.Version
+		}
+		passCredentials = q.Source.Helm.PassCredentials
+	}
+	helmRepos, err := getHelmRepos(appPath, q.Repos, nil)
+	if err != nil {
+		return err
+	}
+	h, err := helm.NewHelmApp(appPath, helmRepos, false, version, q.Repo.Proxy, q.Repo.NoProxy, passCredentials)
+	if err != nil {
+		return err
+	}
+	defer h.Dispose()
+
+    // 📌 values.yaml 파일 경로(resolvedValuesPath)에 실제 파일이 있을 경우 res.Helm.Values에 값 저장
+	if resolvedValuesPath, _, err := pathutil.ResolveValueFilePathOrUrl(appPath, repoRoot, "values.yaml", []string{}); err == nil {
+		if err := loadFileIntoIfExists(resolvedValuesPath, &res.Helm.Values); err != nil {
+			return err
+		}
+	} else {
+		log.Warnf("Values file %s is not allowed: %v", filepath.Join(appPath, "values.yaml"), err)
+	}
+	ignoreMissingValueFiles := false
+	if q.Source.Helm != nil {
+		ignoreMissingValueFiles = q.Source.Helm.IgnoreMissingValueFiles
+	}
+    // 📌 selectedValueFiles 존재할 경우 처리
+	resolvedSelectedValueFiles, err := getResolvedValueFiles(appPath, repoRoot, &v1alpha1.Env{}, q.GetValuesFileSchemes(), selectedValueFiles, q.RefSources, gitRepoPaths, ignoreMissingValueFiles)
+	if err != nil {
+		return fmt.Errorf("failed to resolve value files: %w", err)
+	}
+    // 📌 파라미터로 파싱하여 저장
+	params, err := h.GetParameters(resolvedSelectedValueFiles, appPath, repoRoot)
+	if err != nil {
+		return err
+	}
+	for k, v := range params {
+		res.Helm.Parameters = append(res.Helm.Parameters, &v1alpha1.HelmParameter{
+			Name:  k,
+			Value: v,
+		})
+	}
+	for _, v := range fileParameters(q) {
+		res.Helm.FileParameters = append(res.Helm.FileParameters, &v1alpha1.HelmFileParameter{
+			Name: v.Name,
+			Path: v.Path, // filepath.Join(appPath, v.Path),
+		})
+	}
+	return nil
+}
+```
 
 ```go
 // 🔗 reposerver/repository/repository.go
@@ -272,6 +350,7 @@ func (s *Service) runRepoOperation(
 	hasMultipleSources bool,
 	refSources map[string]*v1alpha1.RefTarget,
 ) error {
+    // 📌 로그에 repo path를 숨기기 위한 작업
 	if sanitizer, ok := grpc.SanitizerFromContext(ctx); ok {
 		// make sure a randomized path replaced with '.' in the error message
 		sanitizer.AddRegexReplacement(getRepoSanitizerRegex(s.rootDir), "<path to cached source>")
@@ -300,12 +379,14 @@ func (s *Service) runRepoOperation(
 		return err
 	}
 
+    // 📌 캐싱 사용이 활성화된 경우 cacheFn 함수 호출
 	if !settings.noCache {
 		if ok, err := cacheFn(revision, repoRefs, true); ok {
 			return err
 		}
 	}
 
+    // 📌 메트릭 관련 로직 수행
 	s.metricsServer.IncPendingRepoRequest(repo.Repo)
 	defer s.metricsServer.DecPendingRepoRequest(repo.Repo)
 
@@ -425,71 +506,94 @@ func (s *Service) runRepoOperation(
 }
 ```
 
+## git clone은 언제?
+다양한 상황에서 checkoutRevision 함수가 호출되며 git clone 및 checkout을 진행한다.
+위에서 본 runRepoOperation 함수 내에서도 checkoutRevision 함수가 호출된다.
 ```go
 // 🔗 reposerver/repository/repository.go
-func populateHelmAppDetails(res *apiclient.RepoAppDetailsResponse, appPath string, repoRoot string, q *apiclient.RepoServerAppDetailsQuery, gitRepoPaths io.TempPaths) error {
-	var selectedValueFiles []string
-	var availableValueFiles []string
-
-	if q.Source.Helm != nil {
-		selectedValueFiles = q.Source.Helm.ValueFiles
-	}
-
-	err := filepath.Walk(appPath, walkHelmValueFilesInPath(appPath, &availableValueFiles))
+// checkoutRevision is a convenience function to initialize a repo, fetch, and checkout a revision
+// Returns the 40 character commit SHA after the checkout has been performed
+func (s *Service) checkoutRevision(gitClient git.Client, revision string, submoduleEnabled bool) (goio.Closer, error) {
+	closer := s.gitRepoInitializer(gitClient.Root())
+	err := checkoutRevision(gitClient, revision, submoduleEnabled)
 	if err != nil {
-		return err
+		s.metricsServer.IncGitFetchFail(gitClient.Root(), revision)
+	}
+	return closer, err
+}
+```
+```go
+// 🔗 reposerver/repository/repository.go
+func checkoutRevision(gitClient git.Client, revision string, submoduleEnabled bool) error {
+	err := gitClient.Init()
+	if err != nil {
+		return status.Errorf(codes.Internal, "Failed to initialize git repo: %v", err)
 	}
 
-	res.Helm = &apiclient.HelmAppSpec{ValueFiles: availableValueFiles}
-	var version string
-	var passCredentials bool
-	if q.Source.Helm != nil {
-		if q.Source.Helm.Version != "" {
-			version = q.Source.Helm.Version
+	revisionPresent := gitClient.IsRevisionPresent(revision)
+
+	log.WithFields(map[string]any{
+		"skipFetch": revisionPresent,
+	}).Debugf("Checking out revision %v", revision)
+
+	// Fetching can be skipped if the revision is already present locally.
+	if !revisionPresent {
+		// Fetching with no revision first. Fetching with an explicit version can cause repo bloat. https://github.com/argoproj/argo-cd/issues/8845
+		err = gitClient.Fetch("")
+		if err != nil {
+			return status.Errorf(codes.Internal, "Failed to fetch default: %v", err)
 		}
-		passCredentials = q.Source.Helm.PassCredentials
 	}
-	helmRepos, err := getHelmRepos(appPath, q.Repos, nil)
-	if err != nil {
-		return err
-	}
-	h, err := helm.NewHelmApp(appPath, helmRepos, false, version, q.Repo.Proxy, q.Repo.NoProxy, passCredentials)
-	if err != nil {
-		return err
-	}
-	defer h.Dispose()
 
-	if resolvedValuesPath, _, err := pathutil.ResolveValueFilePathOrUrl(appPath, repoRoot, "values.yaml", []string{}); err == nil {
-		if err := loadFileIntoIfExists(resolvedValuesPath, &res.Helm.Values); err != nil {
-			return err
-		}
-	} else {
-		log.Warnf("Values file %s is not allowed: %v", filepath.Join(appPath, "values.yaml"), err)
-	}
-	ignoreMissingValueFiles := false
-	if q.Source.Helm != nil {
-		ignoreMissingValueFiles = q.Source.Helm.IgnoreMissingValueFiles
-	}
-	resolvedSelectedValueFiles, err := getResolvedValueFiles(appPath, repoRoot, &v1alpha1.Env{}, q.GetValuesFileSchemes(), selectedValueFiles, q.RefSources, gitRepoPaths, ignoreMissingValueFiles)
+	_, err = gitClient.Checkout(revision, submoduleEnabled)
 	if err != nil {
-		return fmt.Errorf("failed to resolve value files: %w", err)
+		// When fetching with no revision, only refs/heads/* and refs/remotes/origin/* are fetched. If checkout fails
+		// for the given revision, try explicitly fetching it.
+		log.Infof("Failed to checkout revision %s: %v", revision, err)
+		log.Infof("Fallback to fetching specific revision %s. ref might not have been in the default refspec fetched.", revision)
+
+		err = gitClient.Fetch(revision)
+		if err != nil {
+			return status.Errorf(codes.Internal, "Failed to checkout revision %s: %v", revision, err)
+		}
+
+		_, err = gitClient.Checkout("FETCH_HEAD", submoduleEnabled)
+		if err != nil {
+			return status.Errorf(codes.Internal, "Failed to checkout FETCH_HEAD: %v", err)
+		}
 	}
-	params, err := h.GetParameters(resolvedSelectedValueFiles, appPath, repoRoot)
+
+	return err
+}
+```
+```go
+// 🔗 util/git/client.go
+// Init initializes a local git repository and sets the remote origin
+func (m *nativeGitClient) Init() error {
+	_, err := git.PlainOpen(m.root)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, git.ErrRepositoryNotExists) {
+		return err
+	}
+	log.Infof("Initializing %s to %s", m.repoURL, m.root)
+	err = os.RemoveAll(m.root)
+	if err != nil {
+		return fmt.Errorf("unable to clean repo at %s: %w", m.root, err)
+	}
+	err = os.MkdirAll(m.root, 0o755)
 	if err != nil {
 		return err
 	}
-	for k, v := range params {
-		res.Helm.Parameters = append(res.Helm.Parameters, &v1alpha1.HelmParameter{
-			Name:  k,
-			Value: v,
-		})
+	repo, err := git.PlainInit(m.root, false)
+	if err != nil {
+		return err
 	}
-	for _, v := range fileParameters(q) {
-		res.Helm.FileParameters = append(res.Helm.FileParameters, &v1alpha1.HelmFileParameter{
-			Name: v.Name,
-			Path: v.Path, // filepath.Join(appPath, v.Path),
-		})
-	}
-	return nil
+	_, err = repo.CreateRemote(&config.RemoteConfig{
+		Name: git.DefaultRemoteName,
+		URLs: []string{m.repoURL},
+	})
+	return err
 }
 ```
