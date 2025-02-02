@@ -362,6 +362,7 @@ func (s *Service) runRepoOperation(
 	gitClientOpts := git.WithCache(s.cache, !settings.noRevisionCache && !settings.noCache)
 	revision = textutils.FirstNonEmpty(revision, source.TargetRevision)
 	unresolvedRevision := revision
+    // 📌 소스 타입이 helm인지 git인지 따라 client 초기화
 	if source.IsHelm() {
 		helmClient, revision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart, settings.noCache || settings.noRevisionCache)
 		if err != nil {
@@ -399,40 +400,7 @@ func (s *Service) runRepoOperation(
 	}
 
 	if source.IsHelm() {
-		if settings.noCache {
-			err = helmClient.CleanChartCache(source.Chart, revision, repo.Project)
-			if err != nil {
-				return err
-			}
-		}
-		helmPassCredentials := false
-		if source.Helm != nil {
-			helmPassCredentials = source.Helm.PassCredentials
-		}
-		chartPath, closer, err := helmClient.ExtractChart(source.Chart, revision, repo.Project, helmPassCredentials, s.initConstants.HelmManifestMaxExtractedSize, s.initConstants.DisableHelmManifestMaxExtractedSize)
-		if err != nil {
-			return err
-		}
-		defer io.Close(closer)
-		if !s.initConstants.AllowOutOfBoundsSymlinks {
-			err := apppathutil.CheckOutOfBoundsSymlinks(chartPath)
-			if err != nil {
-				oobError := &apppathutil.OutOfBoundsSymlinkError{}
-				if errors.As(err, &oobError) {
-					log.WithFields(log.Fields{
-						common.SecurityField: common.SecurityHigh,
-						"chart":              source.Chart,
-						"revision":           revision,
-						"file":               oobError.File,
-					}).Warn("chart contains out-of-bounds symlink")
-					return fmt.Errorf("chart contains out-of-bounds symlinks. file: %s", oobError.File)
-				}
-				return err
-			}
-		}
-		return operation(chartPath, revision, revision, func() (*operationContext, error) {
-			return &operationContext{chartPath, ""}, nil
-		})
+		...
 	}
 	closer, err := s.repoLock.Lock(gitClient.Root(), revision, settings.allowConcurrent, func() (goio.Closer, error) {
 		return s.checkoutRevision(gitClient, revision, s.initConstants.SubmoduleEnabled)
@@ -443,22 +411,7 @@ func (s *Service) runRepoOperation(
 
 	defer io.Close(closer)
 
-	if !s.initConstants.AllowOutOfBoundsSymlinks {
-		err := apppathutil.CheckOutOfBoundsSymlinks(gitClient.Root())
-		if err != nil {
-			oobError := &apppathutil.OutOfBoundsSymlinkError{}
-			if errors.As(err, &oobError) {
-				log.WithFields(log.Fields{
-					common.SecurityField: common.SecurityHigh,
-					"repo":               repo.Repo,
-					"revision":           revision,
-					"file":               oobError.File,
-				}).Warn("repository contains out-of-bounds symlink")
-				return fmt.Errorf("repository contains out-of-bounds symlinks. file: %s", oobError.File)
-			}
-			return err
-		}
-	}
+    ...
 
 	var commitSHA string
 	if hasMultipleSources {
@@ -469,13 +422,6 @@ func (s *Service) runRepoOperation(
 			return fmt.Errorf("failed to get commit SHA: %w", err)
 		}
 		commitSHA = commit
-	}
-
-	// double-check locking
-	if !settings.noCache {
-		if ok, err := cacheFn(revision, repoRefs, false); ok {
-			return err
-		}
 	}
 
 	// Here commitSHA refers to the SHA of the actual commit, whereas revision refers to the branch/tag name etc
