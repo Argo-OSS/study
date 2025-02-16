@@ -195,7 +195,7 @@
 ### [실험] (*Request).URL().String() 확인
 
 * Makefile 에서 start-local 명령어 찾아서 mod-vendor-local 잠시 disable
-* vendor/k8s.io/client-go/rest/request.go:L727 아래에서 생성한 URL 출력 (fmt.Printf("KHLTEST:::%s\n", url))
+* vendor/k8s.io/client-go/rest/request.go:L1067 아래에서 생성한 URL 출력 (fmt.Printf("KHLTEST:::%s\n", url))
 * 다시 make start-local ARGOCD_GPG_ENABLED=false 실행
 * 실행 로그에서 
     * api-server 의 로그 중
