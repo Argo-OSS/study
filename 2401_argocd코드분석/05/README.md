@@ -205,5 +205,4 @@
     * applications 포함하는 로그 찾기
     * https://127.0.0.1:62963/apis/argoproj.io/v1alpha1/namespaces/argocd/applications?allowWatchBookmarks=true&resourceVersion=6760&timeout=7m25s&timeoutSeconds=445&watch=true
 * 위 API 호출 결과가 (*StreamWatcher).result 를 통해 전파됨 
-
-어디서 구현하고 있는지 못 찾겠다!!!
+* 아마도 k8s API?
