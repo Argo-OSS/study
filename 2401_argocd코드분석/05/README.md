@@ -206,3 +206,10 @@
     * https://127.0.0.1:62963/apis/argoproj.io/v1alpha1/namespaces/argocd/applications?allowWatchBookmarks=true&resourceVersion=6760&timeout=7m25s&timeoutSeconds=445&watch=true
 * 위 API 호출 결과가 (*StreamWatcher).result 를 통해 전파됨 
 * 아마도 k8s API?
+
+## [실험] 다른 클러스터에 배포
+
+* kind 로 다른 클러스터 만들어서 해당 클러스터를 ArgoCD 에 등록
+* 해당 클러스터의 URL (PORT 가 다름) 을 대상으로 똑같이 k8s API 호출하는 것 확인
+
+
